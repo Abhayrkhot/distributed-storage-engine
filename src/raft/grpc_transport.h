@@ -14,9 +14,15 @@
 
 namespace kv::raft {
 
+// "host:port" with `offset` added to the port (peer traffic can use its own
+// listener, separate from client traffic).
+std::string OffsetPort(const std::string& addr, int offset);
+
 class Transport {
  public:
-  Transport(uint32_t self, const std::map<uint32_t, std::string>& members);
+  // `members` holds client-facing addresses; peers are dialed at
+  // port + peer_port_offset.
+  Transport(uint32_t self, const std::map<uint32_t, std::string>& members, int peer_port_offset = 0);
 
   ::kv::raft::Raft::Stub* Stub(uint32_t peer);
   const std::map<uint32_t, std::string>& members() const { return members_; }

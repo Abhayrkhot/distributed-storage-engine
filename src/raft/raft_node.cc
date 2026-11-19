@@ -431,10 +431,14 @@ void RaftNode::TickerLoop() {
   while (!stopping_) {
     const auto now = Clock::now();
     if (role_ == Role::kLeader) {
-      if (opt_.check_quorum && now - leader_since_ > milliseconds(opt_.election_max_ms)) {
+      // CheckQuorum only decides how soon a cut-off leader gives up (lease
+      // safety does not depend on it), so allow two election timeouts before
+      // concluding a busy follower is gone.
+      const auto window = milliseconds(2 * opt_.election_max_ms);
+      if (opt_.check_quorum && now - leader_since_ > window) {
         size_t live = 1;
         for (auto& p : peers_) {
-          if (now - p->last_ack <= milliseconds(opt_.election_max_ms)) ++live;
+          if (now - p->last_ack <= window) ++live;
         }
         if (live < Majority()) {
           KV_LOG(Warning) << "CheckQuorum: heard from " << live << "/" << opt_.members.size()

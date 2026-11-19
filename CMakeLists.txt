@@ -82,6 +82,9 @@ add_library(kv_storage STATIC
   src/storage/engine.cc)
 target_include_directories(kv_storage PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(kv_storage PUBLIC kv_proto ${ABSL_LIBS} Threads::Threads)
+# Objects include generated headers; make sure protoc has run first (Ninja
+# does not order compilation after a linked library's custom commands).
+add_dependencies(kv_storage kv_proto)
 
 add_library(kv_raft STATIC
   src/raft/raft_node.cc
@@ -97,6 +100,7 @@ target_link_libraries(kv_server PUBLIC kv_raft)
 add_library(kv_client STATIC src/client/kv_client.cc)
 target_include_directories(kv_client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(kv_client PUBLIC kv_proto ${ABSL_LIBS})
+add_dependencies(kv_client kv_proto)
 
 add_executable(kvd src/server/main.cc)
 target_link_libraries(kvd PRIVATE kv_server)

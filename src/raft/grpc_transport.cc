@@ -4,7 +4,14 @@
 
 namespace kv::raft {
 
-Transport::Transport(uint32_t self, const std::map<uint32_t, std::string>& members)
+std::string OffsetPort(const std::string& addr, int offset) {
+  if (offset == 0) return addr;
+  const auto colon = addr.rfind(':');
+  return addr.substr(0, colon + 1) + std::to_string(std::stoi(addr.substr(colon + 1)) + offset);
+}
+
+Transport::Transport(uint32_t self, const std::map<uint32_t, std::string>& members,
+                     int peer_port_offset)
     : self_(self), members_(members) {
   for (const auto& [id, addr] : members_) {
     if (id == self_) continue;
@@ -19,7 +26,8 @@ Transport::Transport(uint32_t self, const std::map<uint32_t, std::string>& membe
     args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 10000);
     // Each peer gets its own TCP connection rather than sharing a subchannel.
     args.SetInt("grpc.channel_id", static_cast<int>(id));
-    auto channel = grpc::CreateCustomChannel(addr, grpc::InsecureChannelCredentials(), args);
+    auto channel = grpc::CreateCustomChannel(OffsetPort(addr, peer_port_offset),
+                                             grpc::InsecureChannelCredentials(), args);
     stubs_[id] = ::kv::raft::Raft::NewStub(channel);
   }
 }

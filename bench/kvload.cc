@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -52,6 +53,24 @@ uint64_t NowNs() {
 
 struct Shared {
   std::vector<std::unique_ptr<kv::api::KV::Stub>> stubs;
+  // Channels per address, created on demand when a redirect names a new leader.
+  std::mutex redirect_mu;
+  std::map<std::string, std::vector<std::unique_ptr<kv::api::KV::Stub>>> by_addr;
+  int channels = 1;
+  std::atomic<uint64_t> redirects{0};
+  kv::api::KV::Stub* StubFor(const std::string& addr, int slot) {
+    std::lock_guard<std::mutex> l(redirect_mu);
+    auto& v = by_addr[addr];
+    if (v.empty()) {
+      for (int i = 0; i < channels; ++i) {
+        grpc::ChannelArguments args;
+        args.SetInt("kvload.channel", i);
+        v.push_back(kv::api::KV::NewStub(
+            grpc::CreateCustomChannel(addr, grpc::InsecureChannelCredentials(), args)));
+      }
+    }
+    return v[static_cast<size_t>(slot) % v.size()].get();
+  }
   std::atomic<bool> stop{false};
   std::atomic<bool> measuring{false};
   std::atomic<int> outstanding{0};
@@ -127,7 +146,16 @@ class Slot {
         last_error = st.error_message();
       }
     }
-    if (!st.ok()) std::this_thread::sleep_for(std::chrono::milliseconds(5));  // e.g. leader change
+    if (!st.ok()) {
+      // Leader changed mid-run: follow the redirect, as a real client would.
+      const std::string hint = kv::client::LeaderFromError(st.error_message());
+      if (!hint.empty()) {
+        stub_ = s_->StubFor(hint, id_);
+        s_->redirects.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+    }
     Issue();
   }
 
@@ -186,7 +214,8 @@ int main(int argc, char** argv) {
   s.value_pool.resize(1 << 20);
   std::mt19937_64 rng(1);
   for (auto& c : s.value_pool) c = static_cast<char>('a' + rng() % 26);
-  for (int i = 0; i < absl::GetFlag(FLAGS_channels); ++i) {
+  s.channels = absl::GetFlag(FLAGS_channels);
+  for (int i = 0; i < s.channels; ++i) {
     grpc::ChannelArguments args;
     args.SetInt("kvload.channel", i);  // distinct args => distinct connection
     s.stubs.push_back(kv::api::KV::NewStub(
@@ -227,7 +256,8 @@ int main(int argc, char** argv) {
   std::printf("writes: %.0f/s  %s\n", w.Count() / secs, w.Summary().c_str());
   if (s.batch > 1) std::printf("keys written: %.0f/s (%d per RPC)\n", w.Count() * s.batch / secs, s.batch);
   if (r.Count()) std::printf("reads:  %.0f/s  %s\n", r.Count() / secs, r.Summary().c_str());
-  std::printf("errors: %lu%s%s\n", static_cast<unsigned long>(errors), last_error.empty() ? "" : " last: ",
+  std::printf("errors: %lu, redirects: %lu%s%s\n", static_cast<unsigned long>(errors),
+              static_cast<unsigned long>(s.redirects.load()), last_error.empty() ? "" : " last: ",
               last_error.c_str());
   std::printf(
       "RESULT {\"workload\":\"kvload\",\"label\":\"%s\",\"clients\":%d,\"depth\":%d,\"read_ratio\":%.2f,"

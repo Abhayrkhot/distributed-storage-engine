@@ -34,7 +34,10 @@
 ABSL_FLAG(std::string, mode, "raft", "raft | engine");
 ABSL_FLAG(uint32_t, id, 1, "this node's id (raft mode)");
 ABSL_FLAG(std::string, members, "", "id=host:port,... for every member, including this node");
-ABSL_FLAG(std::string, listen, "", "listen address (default: 0.0.0.0:<own port>)");
+ABSL_FLAG(std::string, listen, "", "client listen address (default: 0.0.0.0:<own port>)");
+ABSL_FLAG(int, peer_port_offset, 1000,
+          "Raft peer traffic uses its own gRPC server on <port>+offset, so client load never "
+          "queues heartbeats (0 = share the client port)");
 ABSL_FLAG(std::string, dir, "./kvd-data", "data directory");
 ABSL_FLAG(std::string, concurrency, "pipelined", "engine mode: pipelined | global");
 ABSL_FLAG(uint32_t, shards, 256, "memtable shards");
@@ -112,7 +115,7 @@ int main(int argc, char** argv) {
     o.num_shards = absl::GetFlag(FLAGS_shards);
     o.apply_threads = absl::GetFlag(FLAGS_apply_threads);
     o.wal = wal;
-    transport = std::make_unique<kv::raft::Transport>(id, *members);
+    transport = std::make_unique<kv::raft::Transport>(id, *members, absl::GetFlag(FLAGS_peer_port_offset));
     auto n = kv::raft::RaftNode::Open(o, transport.get());
     if (!n.ok()) {
       KV_LOG(Error) << "open: " << n.status();
@@ -152,9 +155,26 @@ int main(int argc, char** argv) {
   builder.AddListeningPort(listen, grpc::InsecureServerCredentials(), &bound_port);
   builder.RegisterService(&kv_service);
   builder.RegisterService(&admin_service);
+  std::unique_ptr<grpc::Server> peer_server;
+  const int peer_offset = absl::GetFlag(FLAGS_peer_port_offset);
   if (node) {
     raft_service = std::make_unique<kv::raft::RaftService>(node.get());
-    builder.RegisterService(raft_service.get());
+    if (peer_offset == 0) {
+      builder.RegisterService(raft_service.get());
+    } else {
+      const std::string peer_listen = kv::raft::OffsetPort(listen, peer_offset);
+      grpc::ServerBuilder pb;
+      pb.SetMaxReceiveMessageSize(256 << 20);
+      pb.SetMaxSendMessageSize(256 << 20);
+      int peer_port = 0;
+      pb.AddListeningPort(peer_listen, grpc::InsecureServerCredentials(), &peer_port);
+      pb.RegisterService(raft_service.get());
+      peer_server = pb.BuildAndStart();
+      if (!peer_server || peer_port == 0) {
+        KV_LOG(Error) << "cannot listen on " << peer_listen << " (peer traffic)";
+        return 1;
+      }
+    }
   }
   auto server = builder.BuildAndStart();
   if (!server || bound_port == 0) {
@@ -214,6 +234,7 @@ int main(int argc, char** argv) {
     }
   }
   server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(2));
+  if (peer_server) peer_server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
   metrics.reset();
   if (node) node->Shutdown();
   node.reset();

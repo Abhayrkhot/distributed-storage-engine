@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package kv.snapshot;
+
+// MANIFEST of a snapshot directory (snap-<index>/MANIFEST). Written last, so a
+// directory with a valid manifest is a complete snapshot.
+message SnapshotFile {
+  string name = 1;
+  uint64 size = 2;
+  fixed32 crc32c = 3;
+  uint64 entries = 4;
+}
+
+message SnapshotManifest {
+  uint32 format_version = 1;
+  uint64 index = 2;              // last log index reflected in the data
+  uint64 term = 3;               // term of that entry (0 outside Raft)
+  uint32 num_shards = 4;
+  uint64 wal_start_segment = 5;  // replay WAL segments >= this one
+  repeated SnapshotFile files = 6;
+  uint64 key_count = 7;
+  uint64 byte_size = 8;
+  int64 created_unix_ms = 9;
+  bytes app_state = 10;          // Raft: cluster membership and client sessions
+}

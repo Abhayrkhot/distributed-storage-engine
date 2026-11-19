@@ -1,0 +1,7 @@
+build*/
+.cache/
+compile_commands.json
+*.swp
+.DS_Store
+/results-raw/
+__pycache__/

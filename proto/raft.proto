@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package kv.raft;
+
+// Peer-to-peer Raft RPCs (Ongaro & Ousterhout, "In Search of an Understandable
+// Consensus Algorithm", plus PreVote, CheckQuorum and leadership transfer from
+// the Raft thesis).
+service Raft {
+  rpc RequestVote(VoteRequest) returns (VoteResponse);
+  rpc AppendEntries(AppendRequest) returns (AppendResponse);
+  rpc InstallSnapshot(stream SnapshotChunk) returns (InstallSnapshotResponse);
+  rpc TimeoutNow(TimeoutNowRequest) returns (TimeoutNowResponse);
+}
+
+message Entry {
+  uint64 index = 1;
+  uint64 term = 2;
+  bytes data = 3;
+}
+
+message VoteRequest {
+  uint64 term = 1;
+  uint32 candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+  bool pre_vote = 5;   // probe only; nobody changes term or votes
+  bool transfer = 6;   // leadership transfer: ignore leader stickiness
+}
+
+message VoteResponse {
+  uint64 term = 1;
+  bool granted = 2;
+}
+
+message AppendRequest {
+  uint64 term = 1;
+  uint32 leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated Entry entries = 5;
+  uint64 leader_commit = 6;
+  uint64 round = 7;  // heartbeat round, echoed back (ReadIndex / lease)
+}
+
+message AppendResponse {
+  uint64 term = 1;
+  bool success = 2;
+  uint64 match_index = 3;     // on success: last index known to match
+  uint64 conflict_index = 4;  // on failure: where the leader should retry
+  uint64 conflict_term = 5;
+  uint64 last_log_index = 6;
+  uint64 round = 7;
+}
+
+// The first chunk carries the manifest; later chunks carry file bytes.
+message SnapshotChunk {
+  uint64 term = 1;
+  uint32 leader_id = 2;
+  uint64 last_index = 3;
+  uint64 last_term = 4;
+  bytes manifest = 5;
+  string file = 6;
+  uint64 offset = 7;
+  bytes data = 8;
+}
+
+message InstallSnapshotResponse {
+  uint64 term = 1;
+  bool success = 2;
+}
+
+message TimeoutNowRequest {
+  uint64 term = 1;
+  uint32 leader_id = 2;
+}
+
+message TimeoutNowResponse {
+  uint64 term = 1;
+}

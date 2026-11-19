@@ -1,0 +1,161 @@
+cmake_minimum_required(VERSION 3.25)
+project(distributed_storage_engine VERSION 1.0.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
+endif()
+
+option(KV_SANITIZE "Sanitizers to enable: address, thread, or empty" "")
+option(KV_WERROR "Treat warnings as errors" OFF)
+option(KV_WITH_ROCKSDB "Build the RocksDB baseline engine for benchmarks" ON)
+option(KV_BUILD_TESTS "Build unit and integration tests" ON)
+
+add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+if(KV_WERROR)
+  add_compile_options(-Werror)
+endif()
+if(KV_SANITIZE STREQUAL "address")
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address,undefined)
+elseif(KV_SANITIZE STREQUAL "thread")
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=thread)
+endif()
+if(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+  # The default -O2 leaves measurable throughput on the table for the hot paths.
+  string(REPLACE "-O2" "-O3" CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
+endif()
+
+find_package(Threads REQUIRED)
+find_package(absl CONFIG REQUIRED)
+find_package(Protobuf CONFIG QUIET)
+if(NOT Protobuf_FOUND)
+  find_package(Protobuf REQUIRED)
+endif()
+find_package(gRPC CONFIG REQUIRED)
+
+# ---------------------------------------------------------------------------
+# Generated protobuf / gRPC code
+# ---------------------------------------------------------------------------
+add_library(kv_proto STATIC)
+target_link_libraries(kv_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
+target_include_directories(kv_proto PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/proto)
+set(KV_PROTOS ${CMAKE_CURRENT_SOURCE_DIR}/proto/kv.proto
+              ${CMAKE_CURRENT_SOURCE_DIR}/proto/raft.proto
+              ${CMAKE_CURRENT_SOURCE_DIR}/proto/snapshot.proto)
+target_sources(kv_proto PRIVATE ${KV_PROTOS})
+protobuf_generate(TARGET kv_proto LANGUAGE cpp
+  IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/proto
+  PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/proto)
+protobuf_generate(TARGET kv_proto LANGUAGE grpc
+  IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/proto
+  PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/proto
+  GENERATE_EXTENSIONS .grpc.pb.h .grpc.pb.cc
+  PLUGIN "protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>")
+target_compile_options(kv_proto PRIVATE -w)
+
+# ---------------------------------------------------------------------------
+# Core libraries
+# ---------------------------------------------------------------------------
+# Ubuntu 24.04 ships Abseil 20220623 (no absl/crc or absl/log), so CRC32C and
+# logging live in src/common.
+set(ABSL_LIBS absl::status absl::statusor absl::strings absl::str_format absl::synchronization
+              absl::time absl::btree absl::flat_hash_map absl::random_random
+              absl::flags absl::flags_parse)
+
+add_library(kv_storage STATIC
+  src/common/crc32c.cc
+  src/common/logging.cc
+  src/common/histogram.cc
+  src/common/fs.cc
+  src/storage/write_batch.cc
+  src/storage/wal.cc
+  src/storage/wal_reader.cc
+  src/storage/memtable.cc
+  src/storage/applier.cc
+  src/storage/snapshot.cc
+  src/storage/engine.cc)
+target_include_directories(kv_storage PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(kv_storage PUBLIC kv_proto ${ABSL_LIBS} Threads::Threads)
+
+# Staged build while the replication layer is being written.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/raft/raft_node.cc)
+add_library(kv_raft STATIC
+  src/raft/raft_node.cc
+  src/raft/raft_state_machine.cc
+  src/raft/grpc_transport.cc)
+target_link_libraries(kv_raft PUBLIC kv_storage)
+
+add_library(kv_server STATIC
+  src/server/kv_service.cc
+  src/server/metrics_http.cc)
+target_link_libraries(kv_server PUBLIC kv_raft)
+
+add_library(kv_client STATIC src/client/kv_client.cc)
+target_include_directories(kv_client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(kv_client PUBLIC kv_proto ${ABSL_LIBS})
+
+add_executable(kvd src/server/main.cc)
+target_link_libraries(kvd PRIVATE kv_server)
+
+add_executable(kvctl src/client/kvctl.cc)
+target_link_libraries(kvctl PRIVATE kv_client)
+endif()
+
+# ---------------------------------------------------------------------------
+# Benchmarks
+# ---------------------------------------------------------------------------
+set(KV_BENCH_SOURCES bench/kvbench.cc)
+if(KV_WITH_ROCKSDB)
+  find_package(RocksDB CONFIG QUIET)
+  if(RocksDB_FOUND)
+    set(KV_ROCKSDB_TARGET RocksDB::rocksdb)
+  else()
+    find_library(KV_ROCKSDB_LIB rocksdb)
+    if(KV_ROCKSDB_LIB)
+      set(KV_ROCKSDB_TARGET ${KV_ROCKSDB_LIB})
+    endif()
+  endif()
+endif()
+add_executable(kvbench ${KV_BENCH_SOURCES})
+target_link_libraries(kvbench PRIVATE kv_storage)
+if(KV_ROCKSDB_TARGET)
+  target_compile_definitions(kvbench PRIVATE KV_HAVE_ROCKSDB=1)
+  target_link_libraries(kvbench PRIVATE ${KV_ROCKSDB_TARGET})
+  message(STATUS "kvbench: RocksDB baseline enabled (${KV_ROCKSDB_TARGET})")
+endif()
+
+if(TARGET kv_client)
+add_executable(kvload bench/kvload.cc)
+target_link_libraries(kvload PRIVATE kv_client kv_storage)
+
+add_executable(kvchaos bench/kvchaos.cc)
+target_link_libraries(kvchaos PRIVATE kv_client kv_storage)
+endif()
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+if(KV_BUILD_TESTS)
+  enable_testing()
+  find_package(GTest REQUIRED)
+  add_executable(kv_tests
+    tests/write_batch_test.cc
+    tests/wal_test.cc
+    tests/memtable_test.cc
+    tests/snapshot_test.cc
+    tests/engine_test.cc
+    tests/histogram_test.cc)
+  if(TARGET kv_server)
+    target_sources(kv_tests PRIVATE tests/raft_test.cc)
+    target_link_libraries(kv_tests PRIVATE kv_server kv_client)
+  endif()
+  target_link_libraries(kv_tests PRIVATE kv_storage GTest::gtest GTest::gtest_main)
+  include(GoogleTest)
+  gtest_discover_tests(kv_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 300)
+endif()

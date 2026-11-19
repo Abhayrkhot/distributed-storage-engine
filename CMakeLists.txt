@@ -10,7 +10,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
 endif()
 
-option(KV_SANITIZE "Sanitizers to enable: address, thread, or empty" "")
+set(KV_SANITIZE "" CACHE STRING "Sanitizer: address, thread, or empty")
 option(KV_WERROR "Treat warnings as errors" OFF)
 option(KV_WITH_ROCKSDB "Build the RocksDB baseline engine for benchmarks" ON)
 option(KV_BUILD_TESTS "Build unit and integration tests" ON)
@@ -83,8 +83,6 @@ add_library(kv_storage STATIC
 target_include_directories(kv_storage PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(kv_storage PUBLIC kv_proto ${ABSL_LIBS} Threads::Threads)
 
-# Staged build while the replication layer is being written.
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/raft/raft_node.cc)
 add_library(kv_raft STATIC
   src/raft/raft_node.cc
   src/raft/raft_state_machine.cc
@@ -105,7 +103,6 @@ target_link_libraries(kvd PRIVATE kv_server)
 
 add_executable(kvctl src/client/kvctl.cc)
 target_link_libraries(kvctl PRIVATE kv_client)
-endif()
 
 # ---------------------------------------------------------------------------
 # Benchmarks
@@ -130,13 +127,11 @@ if(KV_ROCKSDB_TARGET)
   message(STATUS "kvbench: RocksDB baseline enabled (${KV_ROCKSDB_TARGET})")
 endif()
 
-if(TARGET kv_client)
 add_executable(kvload bench/kvload.cc)
 target_link_libraries(kvload PRIVATE kv_client kv_storage)
 
 add_executable(kvchaos bench/kvchaos.cc)
 target_link_libraries(kvchaos PRIVATE kv_client kv_storage)
-endif()
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -150,12 +145,9 @@ if(KV_BUILD_TESTS)
     tests/memtable_test.cc
     tests/snapshot_test.cc
     tests/engine_test.cc
-    tests/histogram_test.cc)
-  if(TARGET kv_server)
-    target_sources(kv_tests PRIVATE tests/raft_test.cc)
-    target_link_libraries(kv_tests PRIVATE kv_server kv_client)
-  endif()
-  target_link_libraries(kv_tests PRIVATE kv_storage GTest::gtest GTest::gtest_main)
+    tests/histogram_test.cc
+    tests/raft_test.cc)
+  target_link_libraries(kv_tests PRIVATE kv_server kv_client GTest::gtest GTest::gtest_main)
   include(GoogleTest)
-  gtest_discover_tests(kv_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 300)
+  gtest_discover_tests(kv_tests DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 300)
 endif()

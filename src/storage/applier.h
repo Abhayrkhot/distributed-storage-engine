@@ -14,6 +14,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -53,6 +54,10 @@ class Applier {
   // Blocks until all submitted entries are applied, then runs fn(applied) with
   // the workers idle. Must be called from the producer (or under its lock).
   void RunQuiesced(const std::function<void(uint64_t)>& fn);
+  // Blocks until AppliedIndex() >= index.
+  void WaitApplied(uint64_t index);
+  // Same, giving up after `timeout`; returns whether the index was reached.
+  bool WaitAppliedFor(uint64_t index, std::chrono::milliseconds timeout);
   // Sets the starting index (after recovery) without applying anything.
   void Reset(uint64_t applied);
   int workers() const { return static_cast<int>(workers_.size()); }

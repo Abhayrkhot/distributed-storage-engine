@@ -68,6 +68,7 @@ void Applier::Submit(std::vector<Entry>&& entries) {
 
   const uint64_t last = block->back().index;
   dispatched_ = last;
+  bool advanced_directly = false;
   for (uint32_t w = 0; w < n; ++w) {
     Worker& wk = *workers_[w];
     bool notify = false;
@@ -76,12 +77,19 @@ void Applier::Submit(std::vector<Entry>&& entries) {
       if (per[w].empty() && wk.queue.empty() && !wk.busy) {
         // Nothing for this worker and it is caught up: advance it directly.
         wk.progress.store(last, std::memory_order_release);
+        advanced_directly = true;
         continue;
       }
       wk.queue.push_back(Chunk{block, std::move(per[w]), splits, last});
       notify = !wk.busy;
     }
     if (notify) wk.cv.notify_one();
+  }
+  if (advanced_directly) {
+    // Workers only signal after processing; a direct advance may be what a
+    // WaitApplied() caller is waiting for.
+    { std::lock_guard<std::mutex> l(idle_mu_); }
+    idle_cv_.notify_all();
   }
 }
 
@@ -130,6 +138,16 @@ uint64_t Applier::AppliedIndex() const {
   uint64_t m = UINT64_MAX;
   for (const auto& w : workers_) m = std::min(m, w->progress.load(std::memory_order_acquire));
   return m;
+}
+
+void Applier::WaitApplied(uint64_t index) {
+  std::unique_lock<std::mutex> l(idle_mu_);
+  idle_cv_.wait(l, [&] { return AppliedIndex() >= index; });
+}
+
+bool Applier::WaitAppliedFor(uint64_t index, std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> l(idle_mu_);
+  return idle_cv_.wait_for(l, timeout, [&] { return AppliedIndex() >= index; });
 }
 
 void Applier::RunQuiesced(const std::function<void(uint64_t)>& fn) {

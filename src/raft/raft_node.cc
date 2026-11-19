@@ -69,6 +69,12 @@ absl::Status RaftNode::Recover() {
   for (const auto& d : {opt_.dir, snap_root, opt_.dir + "/wal"}) {
     if (auto st = CreateDirs(d); !st.ok()) return st;
   }
+  // Partially received snapshots from before a crash are useless.
+  if (auto names = ListDir(opt_.dir); names.ok()) {
+    for (const auto& n : *names) {
+      if (n.rfind("incoming", 0) == 0) RemoveAll(opt_.dir + "/" + n).IgnoreError();
+    }
+  }
   if (FileExists(opt_.dir + "/raft-state")) {
     auto hs = ReadFile(opt_.dir + "/raft-state");
     if (!hs.ok()) return hs.status();
@@ -97,7 +103,13 @@ absl::Status RaftNode::Recover() {
       opt_.dir + "/wal", wal_start, base_index_,
       [&](SegmentContents& seg) -> absl::Status {
         for (const auto& e : seg.entries) {
-          if (e.index <= base_index_) continue;
+          if (e.index <= base_index_) {
+            // An overwrite at or below the snapshot index was written after
+            // anything already replayed above it, so it truncated those
+            // entries: they are a stale suffix from an old term.
+            log_.clear();
+            continue;
+          }
           // A record at or below the current end overwrites the suffix: the
           // log was truncated by a new leader after the original was written.
           if (e.index <= LastIndex()) TruncateFrom(e.index);
@@ -142,10 +154,12 @@ void RaftNode::Start() {
   std::lock_guard<std::mutex> l(mu_);
   if (started_) return;
   started_ = true;
+  no_votes_until_ = Clock::now() + milliseconds(opt_.election_min_ms);
   ResetElectionTimer();
   for (auto& p : peers_) {
     Peer* raw = p.get();
     p->thread = std::thread([this, raw] { ReplicatorLoop(raw); });
+    p->hb_thread = std::thread([this, raw] { HeartbeatLoop(raw); });
   }
   ticker_ = std::thread([this] { TickerLoop(); });
   dispatcher_ = std::thread([this] { DispatcherLoop(); });
@@ -164,6 +178,7 @@ void RaftNode::Shutdown() {
     pending_reads_.clear();
   }
   repl_cv_.notify_all();
+  hb_cv_.notify_all();
   commit_cv_.notify_all();
   durable_cv_.notify_all();
   state_cv_.notify_all();
@@ -175,6 +190,7 @@ void RaftNode::Shutdown() {
   }
   for (auto& p : peers_) {
     if (p->thread.joinable()) p->thread.join();
+    if (p->hb_thread.joinable()) p->hb_thread.join();
   }
   for (auto* t : {&ticker_, &dispatcher_, &reader_, &snapshotter_}) {
     if (t->joinable()) t->join();
@@ -263,6 +279,7 @@ void RaftNode::BecomeLeader() {
     p->next_heartbeat = leader_since_;
     p->acked_round = 0;
     p->sent_round = 0;
+    p->hb_round = 0;
     p->timeout_now_sent = false;
   }
   // A no-op in the new term lets the leader commit (and learn the commit
@@ -272,6 +289,7 @@ void RaftNode::BecomeLeader() {
   KV_LOG(Info) << "node " << opt_.id << " is leader for term " << current_term_ << " (log end "
                << LastIndex() << ")";
   repl_cv_.notify_all();
+  hb_cv_.notify_all();
   state_cv_.notify_all();
   if (peers_.empty()) AdvanceCommit();
 }
@@ -368,10 +386,13 @@ grpc::Status RaftNode::HandleRequestVote(const VoteRequest& req, VoteResponse* r
   if (stopping_) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "stopping");
   // Leader stickiness (Raft thesis 4.2.3): while we hear from a live leader,
   // refuse to help unseat it, unless the leader itself asked (transfer).
+  const auto now = Clock::now();
   const bool leader_alive =
       role_ == Role::kLeader ||
-      (leader_id_ != 0 && Clock::now() - last_heard_ < milliseconds(opt_.election_min_ms));
-  if (leader_alive && !req.transfer()) return grpc::Status::OK;
+      (leader_id_ != 0 && now - last_heard_ < milliseconds(opt_.election_min_ms));
+  // After a restart we do not know whether we recently acknowledged a leader
+  // whose lease is still running, so sit out one minimum election timeout.
+  if ((leader_alive || now < no_votes_until_) && !req.transfer()) return grpc::Status::OK;
   const bool up_to_date = req.last_log_term() > LastTerm() ||
                           (req.last_log_term() == LastTerm() && req.last_log_index() >= LastIndex());
   if (req.pre_vote()) {
@@ -494,11 +515,13 @@ void RaftNode::ReplicatorLoop(Peer* p) {
       continue;
     }
     const bool has_entries = p->next <= LastIndex();
-    const bool need_round = read_round_ > p->sent_round;
     const bool transfer_ping = transferring_ && transfer_target_ == p->id &&
                                !p->timeout_now_sent && p->match == LastIndex();
-    if (!has_entries && !need_round && !transfer_ping && now < p->next_heartbeat) {
-      repl_cv_.wait_until(l, p->next_heartbeat);
+    if (!has_entries && !transfer_ping) {
+      // Heartbeats are the heartbeat thread's job; wait for entries.
+      ++repl_idle_;
+      repl_cv_.wait_until(l, now + hb);
+      --repl_idle_;
       continue;
     }
     const uint64_t term = current_term_;
@@ -593,8 +616,61 @@ void RaftNode::ReplicatorLoop(Peer* p) {
           if (t < resp.conflict_term()) break;
         }
       }
-      p->next = std::clamp<uint64_t>(next, p->match + 1, LastIndex() + 1);
+      p->next = std::max(p->match + 1, std::min(next, LastIndex() + 1));
     }
+    UpdateLeaseAndReads();
+  }
+}
+
+// Heartbeats travel separately from log entries, so neither a multi-megabyte
+// batch nor a slow fsync on the follower delays them. prev is the follower's
+// known match index (durable there), so the follower answers at once and
+// learns the commit index up to what it holds.
+void RaftNode::HeartbeatLoop(Peer* p) {
+  auto* stub = transport_->Stub(p->id);
+  const auto hb = milliseconds(opt_.heartbeat_ms);
+  Clock::time_point next{};
+  std::unique_lock<std::mutex> l(mu_);
+  while (!stopping_) {
+    if (role_ != Role::kLeader) {
+      hb_cv_.wait(l);
+      next = {};
+      continue;
+    }
+    const auto now = Clock::now();
+    if (now < next && read_round_ <= p->hb_round) {
+      hb_cv_.wait_until(l, next);
+      continue;
+    }
+    next = now + hb;
+    if (transport_->IsBlocked(p->id)) continue;
+    const uint64_t term = current_term_;
+    AppendRequest req;
+    req.set_term(term);
+    req.set_leader_id(opt_.id);
+    const uint64_t prev = p->match >= base_index_ ? p->match : 0;
+    req.set_prev_log_index(prev);
+    req.set_prev_log_term(TermAt(prev));
+    req.set_leader_commit(commit_index_);
+    req.set_round(read_round_);
+    p->hb_round = read_round_;
+    l.unlock();
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + milliseconds(opt_.election_min_ms));
+    AppendResponse resp;
+    grpc::Status s = stub->AppendEntries(&ctx, req, &resp);
+    l.lock();
+    if (stopping_ || current_term_ != term || role_ != Role::kLeader || !s.ok()) continue;
+    if (resp.term() > current_term_) {
+      BecomeFollower(resp.term(), 0);
+      continue;
+    }
+    // Any reply in our term (even a log mismatch) means the follower accepts
+    // this node as leader: that is what CheckQuorum, the lease and ReadIndex
+    // need.
+    p->reachable = true;
+    p->last_ack = std::max(p->last_ack, now);
+    p->acked_round = std::max(p->acked_round, resp.round());
     UpdateLeaseAndReads();
   }
 }
@@ -610,11 +686,18 @@ bool RaftNode::SendSnapshot(Peer* p, uint64_t term) {
   auto manifest_bytes = ReadFile(dir + "/MANIFEST");
   auto manifest = ReadManifest(dir);
   auto fail = [&](const std::string& why) {
-    if (p->reachable) KV_LOG(Warning) << "snapshot " << index << " to " << p->id << " failed: " << why;
     std::lock_guard<std::mutex> l(mu_);
+    if (p->reachable) KV_LOG(Warning) << "snapshot " << index << " to " << p->id << " failed: " << why;
     p->reachable = false;
     return false;
   };
+  auto still_leader = [&] {
+    std::lock_guard<std::mutex> l(mu_);
+    return !stopping_ && current_term_ == term && role_ == Role::kLeader;
+  };
+  // The lease may only count from when the follower last confirmed this
+  // leader; the stream start is conservative.
+  const auto started = Clock::now();
   if (index == 0 || !manifest_bytes.ok() || !manifest.ok()) return fail("no snapshot on disk");
 
   KV_LOG(Info) << "sending snapshot @" << index << " to node " << p->id;
@@ -650,6 +733,7 @@ bool RaftNode::SendSnapshot(Peer* p, uint64_t term) {
       c.set_data(buf.data(), static_cast<size_t>(n));
       ok = writer->Write(c);
       off += static_cast<uint64_t>(n);
+      if (ok && (off / kSnapshotChunk) % 16 == 0) ok = still_leader();  // deposed: stop streaming
     }
     ::close(fd);
   }
@@ -667,7 +751,7 @@ bool RaftNode::SendSnapshot(Peer* p, uint64_t term) {
   if (resp.success()) {
     p->match = std::max(p->match, index);
     p->next = std::max(p->next, index + 1);
-    p->last_ack = Clock::now();
+    p->last_ack = std::max(p->last_ack, started);
     AdvanceCommit();
   }
   KV_LOG(Info) << "snapshot @" << index << " delivered to node " << p->id;
@@ -696,6 +780,7 @@ grpc::Status RaftNode::HandleAppendEntries(const AppendRequest& req, AppendRespo
     state_cv_.notify_all();  // e.g. a TransferLeadership() caller waiting to learn the new leader
   }
   last_heard_ = Clock::now();
+  ++election_id_;  // late PreVote grants must not start an election now
   ResetElectionTimer();
   resp->set_term(current_term_);
 
@@ -780,12 +865,25 @@ grpc::Status RaftNode::HandleInstallSnapshot(grpc::ServerReader<SnapshotChunk>* 
     }
     leader_id_ = chunk.leader_id();
     last_heard_ = Clock::now();
+    ++election_id_;
     ResetElectionTimer();
     resp->set_term(current_term_);
   }
   KV_LOG(Info) << "receiving snapshot @" << index << " from node " << chunk.leader_id();
-  const std::string incoming = opt_.dir + "/incoming";
-  RemoveAll(incoming).IgnoreError();
+  const uint64_t term = chunk.term();
+  // One install at a time; a stream from a deposed leader notices the newer
+  // term below and gives up, so it cannot hold this for long.
+  std::lock_guard<std::mutex> install(install_mu_);
+  // A private directory per stream: nothing else can write into it, and a
+  // leftover from a crash is removed at startup.
+  const std::string incoming =
+      absl::StrCat(opt_.dir, "/incoming-", index, "-", term, "-", ++install_seq_);
+  struct Cleanup {
+    std::string dir;
+    ~Cleanup() {
+      if (!dir.empty()) RemoveAll(dir).IgnoreError();
+    }
+  } cleanup{incoming};
   if (auto st = CreateDirs(incoming); !st.ok()) {
     return grpc::Status(grpc::StatusCode::INTERNAL, std::string(st.message()));
   }
@@ -798,15 +896,19 @@ grpc::Status RaftNode::HandleInstallSnapshot(grpc::ServerReader<SnapshotChunk>* 
   }
   std::map<std::string, int> fds;
   for (const auto& f : manifest->files()) {
-    if (f.name().find('/') != std::string::npos) {
+    if (f.name().empty() || f.name().find('/') != std::string::npos || f.name() == "MANIFEST") {
+      for (auto& [n, fd] : fds) ::close(fd);
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "bad file name");
     }
     int fd = ::open((incoming + "/" + f.name()).c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) return grpc::Status(grpc::StatusCode::INTERNAL, "open snapshot file");
+    if (fd < 0) {
+      for (auto& [n, fd2] : fds) ::close(fd2);
+      return grpc::Status(grpc::StatusCode::INTERNAL, "open snapshot file");
+    }
     fds[f.name()] = fd;
   }
   bool ok = true;
-  size_t chunks = 0;
+  auto last_touch = Clock::now();
   while (ok && reader->Read(&chunk)) {
     auto it = fds.find(chunk.file());
     if (it == fds.end()) {
@@ -814,9 +916,17 @@ grpc::Status RaftNode::HandleInstallSnapshot(grpc::ServerReader<SnapshotChunk>* 
       break;
     }
     ok = PWriteAll(it->second, chunk.data().data(), chunk.data().size(), chunk.offset()).ok();
-    if (++chunks % 64 == 0) {
+    if (Clock::now() - last_touch >= milliseconds(opt_.heartbeat_ms)) {
+      // Still hearing from the leader: keep the election timer and leader
+      // stickiness fresh, and abandon the stream if a newer term appeared.
+      last_touch = Clock::now();
       std::lock_guard<std::mutex> l(mu_);
-      last_heard_ = Clock::now();
+      if (current_term_ != term || stopping_) {
+        ok = false;
+        break;
+      }
+      last_heard_ = last_touch;
+      ++election_id_;
       ResetElectionTimer();
     }
   }
@@ -825,7 +935,9 @@ grpc::Status RaftNode::HandleInstallSnapshot(grpc::ServerReader<SnapshotChunk>* 
     ::close(fd);
   }
   if (!ok || !VerifySnapshotDir(incoming, *manifest).ok()) {
-    return grpc::Status(grpc::StatusCode::DATA_LOSS, "snapshot transfer incomplete or corrupt");
+    std::lock_guard<std::mutex> l(mu_);
+    resp->set_term(current_term_);
+    return grpc::Status(grpc::StatusCode::DATA_LOSS, "snapshot transfer incomplete, stale or corrupt");
   }
 
   // Install. Lock order: dispatch_mu_ (pauses the dispatcher) before mu_.
@@ -835,6 +947,8 @@ grpc::Status RaftNode::HandleInstallSnapshot(grpc::ServerReader<SnapshotChunk>* 
     std::unique_lock<std::mutex> l(mu_);
     state_cv_.wait(l, [&] { return !snap_in_progress_ || stopping_; });
     if (stopping_) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "stopping");
+    resp->set_term(current_term_);
+    if (current_term_ != term) return grpc::Status::OK;  // a newer leader exists
     if (index <= dispatched_index_) {  // already have this state
       resp->set_success(true);
       return grpc::Status::OK;
@@ -864,6 +978,7 @@ grpc::Status RaftNode::HandleInstallSnapshot(grpc::ServerReader<SnapshotChunk>* 
   if (st.ok()) st = RenameFile(incoming, final_dir);
   if (st.ok()) st = SyncDir(root);
   if (!st.ok()) KV_LOG(Fatal) << "installing snapshot failed: " << st;
+  cleanup.dir.clear();  // renamed into place
   if (!keep_suffix) wal_->DropBefore(start_seg);
   const int threads = opt_.recovery_threads > 0 ? opt_.recovery_threads
                                                 : static_cast<int>(std::thread::hardware_concurrency());
@@ -885,6 +1000,9 @@ grpc::Status RaftNode::HandleInstallSnapshot(grpc::ServerReader<SnapshotChunk>* 
     snap_term_ = lterm;
     bytes_since_snapshot_ = 0;
     installing_ = false;
+    last_heard_ = Clock::now();
+    ResetElectionTimer();
+    resp->set_term(current_term_);
     commit_cv_.notify_one();
     state_cv_.notify_all();
   }
@@ -916,7 +1034,9 @@ void RaftNode::Propose(uint64_t client_id, uint64_t seq, std::string batch_rep,
   }
   AppendLocal(current_term_, std::move(data));
   pending_[LastIndex()] = Pending{current_term_, done};
-  repl_cv_.notify_all();
+  // Busy replicators pick the entry up when their current RPC returns; only
+  // parked ones need a wakeup.
+  if (repl_idle_ > 0) repl_cv_.notify_all();
 }
 
 void RaftNode::ReadBarrier(ReadMode mode, std::function<void(const absl::Status&)> done) {
@@ -935,7 +1055,8 @@ void RaftNode::ReadBarrier(ReadMode mode, std::function<void(const absl::Status&
   // The read must observe every write committed before it arrived, including
   // ones committed by earlier leaders: wait for this term's no-op as well.
   const uint64_t read_index = std::max(commit_index_, leader_first_index_);
-  const bool lease_ok = mode == ReadMode::kLease && opt_.check_quorum && Clock::now() < lease_until_;
+  const bool lease_ok = mode == ReadMode::kLease && opt_.check_quorum && !transferring_ &&
+                        Clock::now() < lease_until_;
   if (lease_ok || peers_.empty()) {
     if (sm_->AppliedIndex() >= read_index) {
       l.unlock();
@@ -950,7 +1071,7 @@ void RaftNode::ReadBarrier(ReadMode mode, std::function<void(const absl::Status&
   // answers after this point. Concurrent reads share rounds.
   const bool idle = pending_reads_.empty();
   pending_reads_.push_back(ReadWaiter{++read_round_, read_index, std::move(done)});
-  if (idle) repl_cv_.notify_all();
+  if (idle) hb_cv_.notify_all();
 }
 
 void RaftNode::ReaderLoop() {
@@ -985,6 +1106,7 @@ absl::Status RaftNode::TransferLeadership(uint32_t target, uint32_t* new_leader)
   }
   if (!tp) return absl::InvalidArgumentError("unknown target");
   transferring_ = true;
+  lease_until_ = {};  // the target may win without our stickiness: no lease reads
   transfer_target_ = tp->id;
   tp->timeout_now_sent = false;
   transfer_deadline_ = Clock::now() + milliseconds(opt_.election_max_ms * 2);
@@ -1047,9 +1169,18 @@ void RaftNode::StartLocalSnapshot() {
   std::string app_state;
   sm_->BeginSnapshot(&index, &app_state);
   std::lock_guard<std::mutex> l(mu_);
-  snap_in_progress_ = true;
   snap_forced_ = false;
   bytes_since_snapshot_ = 0;
+  if (index == 0 || index <= snap_index_) {
+    // Nothing applied since the last snapshot: nothing to write.
+    sm_->memtable().AbortSnapshot();
+    ++snapshots_done_;
+    last_snapshot_status_ = absl::OkStatus();
+    state_cv_.notify_all();
+    return;
+  }
+  snap_in_progress_ = true;
+  snap_requested_ = true;
   snap_pending_index_ = index;
   snap_pending_term_ = TermAt(index);
   snap_pending_state_ = std::move(app_state);
@@ -1059,8 +1190,9 @@ void RaftNode::StartLocalSnapshot() {
 void RaftNode::SnapshotLoop() {
   std::unique_lock<std::mutex> l(mu_);
   for (;;) {
-    state_cv_.wait(l, [&] { return stopping_ || snap_pending_index_ != 0; });
-    if (snap_pending_index_ == 0) return;  // stopping, nothing in flight
+    state_cv_.wait(l, [&] { return stopping_ || snap_requested_; });
+    if (!snap_requested_) return;  // stopping, nothing in flight
+    snap_requested_ = false;
     SnapshotWriteOptions so;
     so.index = snap_pending_index_;
     so.term = snap_pending_term_;

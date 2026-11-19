@@ -1,0 +1,36 @@
+# Three-node cluster on one Docker host:
+#   docker compose -f docker/docker-compose.yml up -d --build
+#   docker compose -f docker/docker-compose.yml exec n1 kvctl --endpoints=n1:7001,n2:7001,n3:7001 status
+x-kvd: &kvd
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  image: kvd:latest
+  restart: unless-stopped
+  stop_grace_period: 10s
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:9100/readyz"]
+    interval: 2s
+    retries: 15
+
+services:
+  n1:
+    <<: *kvd
+    command: ["--id=1", "--members=1=n1:7001,2=n2:7001,3=n3:7001", "--metrics_port=9100"]
+    volumes: [n1:/var/lib/kvd]
+    ports: ["7001:7001"]
+  n2:
+    <<: *kvd
+    command: ["--id=2", "--members=1=n1:7001,2=n2:7001,3=n3:7001", "--metrics_port=9100"]
+    volumes: [n2:/var/lib/kvd]
+    ports: ["7002:7001"]
+  n3:
+    <<: *kvd
+    command: ["--id=3", "--members=1=n1:7001,2=n2:7001,3=n3:7001", "--metrics_port=9100"]
+    volumes: [n3:/var/lib/kvd]
+    ports: ["7003:7001"]
+
+volumes:
+  n1:
+  n2:
+  n3:

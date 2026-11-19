@@ -181,6 +181,14 @@ absl::Status MemTable::LoadShard(uint32_t shard, std::string_view data, uint64_t
   return absl::OkStatus();
 }
 
+void MemTable::AbortSnapshot() {
+  for (auto& sp : shards_) {
+    std::unique_lock<std::shared_mutex> l(sp->mu);
+    sp->snap_pending = false;
+    sp->undo.clear();
+  }
+}
+
 void MemTable::Clear() {
   for (auto& sp : shards_) {
     std::unique_lock<std::shared_mutex> l(sp->mu);

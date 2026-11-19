@@ -92,11 +92,23 @@ absl::StatusOr<snapshot::SnapshotManifest> WriteSnapshot(const std::string& root
   const std::string tmp_dir = final_dir + ".tmp";
   if (FileExists(final_dir)) {
     auto existing = ReadManifest(final_dir);
-    if (existing.ok()) return *existing;  // already have this exact snapshot
-    if (auto st = RemoveAll(final_dir); !st.ok()) return st;
+    if (existing.ok()) {  // already have this exact snapshot
+      mem.AbortSnapshot();
+      return *existing;
+    }
+    if (auto st = RemoveAll(final_dir); !st.ok()) {
+      mem.AbortSnapshot();
+      return st;
+    }
   }
-  if (auto st = RemoveAll(tmp_dir); !st.ok()) return st;
-  if (auto st = CreateDirs(tmp_dir); !st.ok()) return st;
+  if (auto st = RemoveAll(tmp_dir); !st.ok()) {
+    mem.AbortSnapshot();
+    return st;
+  }
+  if (auto st = CreateDirs(tmp_dir); !st.ok()) {
+    mem.AbortSnapshot();
+    return st;
+  }
 
   const int nfiles = std::max(1, std::min<int>(opt.files, static_cast<int>(mem.num_shards())));
   std::vector<snapshot::SnapshotFile> files(static_cast<size_t>(nfiles));
@@ -142,6 +154,7 @@ absl::StatusOr<snapshot::SnapshotManifest> WriteSnapshot(const std::string& root
     return s;
   });
   if (!st.ok()) {
+    mem.AbortSnapshot();  // shards not serialized yet would keep copying on write
     RemoveAll(tmp_dir).IgnoreError();
     return st;
   }

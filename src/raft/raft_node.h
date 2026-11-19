@@ -10,7 +10,9 @@
 //   <dir>/snapshots/   state machine snapshots at an applied index
 //
 // Threads: a replicator per peer (one AppendEntries in flight each, batching
-// whatever accumulated meanwhile), a ticker (elections, CheckQuorum), a commit
+// whatever accumulated meanwhile), a heartbeat sender per peer (so a large
+// batch or a slow follower fsync never delays leadership confirmation,
+// CheckQuorum, leases or ReadIndex rounds), a ticker (elections, CheckQuorum), a commit
 // dispatcher (feeds committed entries to the parallel applier), a reader
 // (serves confirmed linearizable reads once applied), and a snapshot writer.
 #pragma once
@@ -49,7 +51,7 @@ struct RaftOptions {
   int heartbeat_ms = 20;
   int election_min_ms = 100;
   int election_max_ms = 200;
-  size_t max_append_bytes = 8u << 20;
+  size_t max_append_bytes = 2u << 20;
   size_t max_append_entries = 16384;
   uint64_t snapshot_trigger_bytes = 256ull << 20;  // log bytes applied since the last snapshot
   uint64_t log_retain_entries = 100000;            // kept in memory behind a snapshot
@@ -152,7 +154,9 @@ class RaftNode {
     uint64_t sent_round = 0;
     bool reachable = false;
     bool timeout_now_sent = false;
-    std::thread thread;
+    uint64_t hb_round = 0;  // read round carried by the last heartbeat
+    std::thread thread;     // replicator: log entries, snapshots, TimeoutNow
+    std::thread hb_thread;  // heartbeats, independent of slow appends
   };
   struct ReadWaiter {
     uint64_t round;
@@ -186,6 +190,7 @@ class RaftNode {
 
   void OnWalDurable(const absl::Status& st, std::vector<Wal::Record>&& group);
   void ReplicatorLoop(Peer* peer);
+  void HeartbeatLoop(Peer* peer);
   bool SendSnapshot(Peer* peer, uint64_t term);
   void TickerLoop();
   void DispatcherLoop();
@@ -202,6 +207,8 @@ class RaftNode {
 
   mutable std::mutex mu_;
   std::condition_variable repl_cv_;     // replicators
+  std::condition_variable hb_cv_;       // heartbeat senders
+  int repl_idle_ = 0;                   // replicators parked with nothing to send
   std::condition_variable commit_cv_;   // dispatcher
   std::condition_variable durable_cv_;  // AppendEntries handlers waiting for fsync
   std::condition_variable state_cv_;    // role changes, snapshot/transfer progress
@@ -251,12 +258,16 @@ class RaftNode {
   uint64_t bytes_since_snapshot_ = 0;
   bool snap_in_progress_ = false;
   bool snap_forced_ = false;
+  bool snap_requested_ = false;
   uint64_t snap_pending_index_ = 0;
   uint64_t snap_pending_term_ = 0;
   std::string snap_pending_state_;
   uint64_t snapshots_done_ = 0;
   absl::Status last_snapshot_status_;
   std::mutex dispatch_mu_;  // held while the dispatcher feeds the state machine
+  std::mutex install_mu_;   // one InstallSnapshot at a time
+  uint64_t install_seq_ = 0;
+  Clock::time_point no_votes_until_{};  // vote embargo after restart
 
   // Outstanding async vote RPCs (must finish before destruction).
   std::mutex calls_mu_;

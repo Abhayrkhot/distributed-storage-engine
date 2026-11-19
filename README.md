@@ -1,46 +1,90 @@
 # Distributed Storage Engine
 
-A replicated key-value store in C++20: a group-commit write-ahead log, a sharded
-in-memory index with copy-on-write snapshots, parallel crash recovery, and Raft
-replication over gRPC.
+A replicated key-value store in C++20. Each node runs a group-commit write-ahead
+log, a sharded in-memory index with copy-on-write snapshots, parallel crash
+recovery, and Raft replication over gRPC with quorum-acknowledged, exactly-once
+writes and linearizable reads.
 
-> Work in progress. The storage engine is complete and tested; replication,
-> the server and the full benchmark write-up land in the next milestones.
+<!-- RESULTS -->
 
-## Storage engine
+## What's inside
 
-```
-caller ──Append──▶ WAL queue ──writer: one pwrite + one fdatasync per group──▶
-Applier (N workers, routed by shard) ──▶ memtable updated, caller acknowledged
-```
+| Layer | Highlights |
+|---|---|
+| **WAL** (`src/storage/wal.*`) | Group commit: one `pwrite` + one `fdatasync` per batch of concurrent writes. Pre-zeroed (`O_DIRECT`) and recycled 64 MiB segments, so flushes never journal a file-size change. CRC32C over segment seq + record. Fail-stop on fsync errors. |
+| **MemTable** (`memtable.*`) | 256 hash shards, each an `absl::btree_map` behind its own reader/writer lock. Copy-on-write undo maps give point-in-time snapshots while writes continue. |
+| **Applier** (`applier.*`) | Committed entries routed to N workers by shard: per-key order is preserved while applies and completions run in parallel. |
+| **Snapshots + recovery** (`snapshot.*`, `wal_reader.*`, `engine.*`) | Multi-file snapshots written and loaded in parallel, CRC-checked. WAL replay with parallel decode/apply; torn tails dropped, index gaps fail loudly. |
+| **Raft** (`src/raft/`) | PreVote, leader stickiness, CheckQuorum, quorum commit of fsynced entries, conflict-term log repair, ReadIndex and lease reads, InstallSnapshot, log compaction, leadership transfer, exactly-once client sessions. |
+| **Server** (`src/server/`) | `kvd`: gRPC callback API (no thread blocks on a write), Admin service, Prometheus `/metrics`, `/healthz`, `/readyz`, graceful handover on SIGTERM. Also runs as a standalone engine, including the naive single-lock baseline. |
+| **Tools** (`src/client/`, `bench/`) | Retrying client with leader redirects, `kvctl`, `kvbench` (in-process + crash/recover + RocksDB baseline), `kvload` (closed-loop gRPC load), `kvchaos` (kills leaders under load and verifies nothing acknowledged is lost). |
 
-- **Group commit.** Writers only take a short queue lock. One writer thread
-  drains everything queued since its last pass into one `pwrite` and one
-  `fdatasync`, so a single flush covers hundreds of writes under load.
-- **Pre-zeroed, recycled WAL segments.** Appends overwrite blocks that already
-  exist, so `fdatasync` does not have to journal a file-size change. Segments
-  are zero-filled with `O_DIRECT` so ext4's ordered-mode journal never makes
-  the WAL's flush wait on the zeroing. The segment number is folded into each
-  record's CRC32C, so stale records in a recycled file never verify.
-- **Sharded index.** 256 B-tree shards, each behind its own reader/writer lock.
-- **Parallel apply.** Operations are routed to the worker that owns their shard,
-  which keeps per-key order while completions run on several threads.
-- **Point-in-time snapshots without stopping writes.** The first change to each
-  key after a snapshot starts saves the old value in a per-shard undo map, so
-  the serializer emits exactly the state at the snapshot index.
-- **Crash recovery.** Load the newest valid snapshot (files checked in parallel
-  against their CRC32C), then replay the WAL tail with decode and apply spread
-  over all cores. A torn tail is dropped; a gap in log indexes anywhere else
-  fails recovery instead of silently losing acknowledged writes.
+Design notes: [docs/architecture.md](docs/architecture.md). All measurements:
+[docs/results.md](docs/results.md).
 
-## Building
+## Quick start
 
-Everything builds from Ubuntu 24.04 packages (gRPC 1.51, protobuf 3.21,
-Abseil, RocksDB 8.9 for the baseline, GoogleTest):
+Build (Ubuntu 24.04 packages: gRPC 1.51, protobuf, Abseil, GoogleTest; RocksDB
+only for the baseline benchmark):
 
 ```bash
 docker build -t kvdev:24.04 -f docker/dev.Dockerfile docker
 scripts/dev.sh 'cmake -S . -B build -G Ninja && cmake --build build && ./build/kv_tests'
+```
+
+Run a 3-node cluster:
+
+```bash
+M=1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003
+for i in 1 2 3; do ./build/kvd --id=$i --members=$M --dir=/tmp/kvd/n$i --metrics_port=910$i & done
+E=127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
+./build/kvctl --endpoints=$E put hello world
+./build/kvctl --endpoints=$E get hello            # linearizable (ReadIndex)
+./build/kvctl --endpoints=$E status
+./build/kvctl --endpoints=$E transfer             # graceful leadership handover
+curl -s localhost:9101/metrics
+```
+
+Or with Docker Compose: `docker compose -f docker/docker-compose.yml up -d --build`.
+
+Reproduce the benchmarks (inside the dev container; each script writes JSON
+lines to `results/raw/`, and `scripts/report.py` renders `docs/results.md`):
+
+```bash
+scripts/dev.sh scripts/host-info.sh
+scripts/dev.sh scripts/bench-engine.sh       # durable write throughput, RocksDB baseline, ablations
+scripts/dev.sh scripts/bench-contention.sh   # 32 clients over gRPC: global lock vs sharded/pipelined
+scripts/dev.sh scripts/bench-recovery.sh     # SIGKILL + restart with 1M / 10M keys
+scripts/dev.sh scripts/bench-cluster.sh      # 3-node replicated throughput/latency
+scripts/dev.sh scripts/bench-chaos.sh        # 5 min of leader kills under load
+python3 scripts/report.py
+```
+
+## Guarantees
+
+- A write is acknowledged only after it is durable on a majority (leader plus
+  at least one follower in a 3-node cluster) and applied.
+- `LINEARIZABLE` reads go through ReadIndex; `LEASE` reads use the leader
+  lease, whose safety relies on bounded clock drift; `STALE` reads may lag.
+- A write retried with the same `(client_id, seq)` is applied at most once.
+- A node that cannot persist to disk stops instead of acknowledging.
+- Membership is static, there is no authentication or TLS, and the data set
+  must fit in memory (the index is an in-memory B-tree, recovered from
+  snapshots and the WAL).
+
+## Layout
+
+```
+proto/            kv.proto (client API), raft.proto (peer RPCs), snapshot.proto
+src/common/       crc32c (SSE4.2/ARMv8), logging, histogram, fs helpers
+src/storage/      wal, wal_reader, memtable, applier, snapshot, engine
+src/raft/         raft_node, raft_state_machine, grpc_transport
+src/server/       kvd main, KV/Admin services, metrics endpoint
+src/client/       client library, kvctl
+bench/            kvbench, kvload, kvchaos
+tests/            GoogleTest suites (storage + in-process Raft clusters)
+scripts/          dev container wrapper, benchmark scripts, report generator
+docker/           dev image, runtime image, docker-compose cluster
 ```
 
 ## License

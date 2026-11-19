@@ -78,6 +78,9 @@ class MemTable {
   uint64_t SerializeShard(uint32_t shard, std::string* out);
   // Inserts pre-sorted entries produced by SerializeShard (recovery path).
   absl::Status LoadShard(uint32_t shard, std::string_view data, uint64_t count);
+  // Ends a snapshot without serializing the remaining shards (failure, or
+  // nothing new to write), so writers stop recording undo entries.
+  void AbortSnapshot();
   // Drops all data (used before installing a snapshot).
   void Clear();
 

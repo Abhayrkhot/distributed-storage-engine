@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  DEPS: >-
+    cmake ninja-build g++ protobuf-compiler protobuf-compiler-grpc libprotobuf-dev
+    libgrpc++-dev libabsl-dev librocksdb-dev libgtest-dev libgmock-dev
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $DEPS
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DKV_WERROR=ON
+      - run: cmake --build build
+      - name: unit and in-process cluster tests
+        run: ./build/kv_tests
+      - name: 3-node cluster smoke test
+        run: |
+          set -e
+          M=1=127.0.0.1:7101,2=127.0.0.1:7102,3=127.0.0.1:7103
+          E=127.0.0.1:7101,127.0.0.1:7102,127.0.0.1:7103
+          for i in 1 2 3; do ./build/kvd --id=$i --members=$M --dir=/tmp/smoke/n$i --log_level=warning & done
+          sleep 2
+          ./build/kvctl --endpoints=$E put hello world
+          test "$(./build/kvctl --endpoints=$E get hello)" = world
+          ./build/kvctl --endpoints=$E status
+          ./build/kvctl --endpoints=$E transfer
+          test "$(./build/kvctl --endpoints=$E get hello)" = world
+          pkill -TERM kvd; wait
+      - name: chaos (leader kills under load, no lost writes)
+        run: ./build/kvchaos --kvd=./build/kvd --dir=/tmp/chaos --duration=30 --graceful_every=3 --workers=8
+      - name: engine smoke benchmark
+        run: |
+          ./build/kvbench --dir=/tmp/bench --duration=3 --threads=16 --depth=64
+          ./build/kvbench --workload=recover --dir=/tmp/rec --records=200000 --tail_records=20000
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $DEPS
+      - run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DKV_SANITIZE=${{ matrix.sanitizer }} -DKV_WITH_ROCKSDB=OFF
+      - run: cmake --build build --target kv_tests
+      - name: run tests
+        run: |
+          if [ "${{ matrix.sanitizer }}" = thread ]; then
+            # Ubuntu's gRPC is not built with TSan, so its internals report
+            # false positives; the storage layer (no gRPC) runs under TSan.
+            setarch "$(uname -m)" -R ./build/kv_tests --gtest_filter=-RaftTest.*
+          else
+            ./build/kv_tests
+          fi

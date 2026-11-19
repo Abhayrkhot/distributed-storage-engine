@@ -6,6 +6,7 @@
 // histogram after a --warmup period.
 //
 //   kvload --endpoints=127.0.0.1:7001,... --clients=32 --depth=1 --duration=20
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -37,6 +38,7 @@ ABSL_FLAG(std::string, consistency, "linearizable", "linearizable | lease | stal
 ABSL_FLAG(int, value_size, 100, "value bytes");
 ABSL_FLAG(uint64_t, key_space, 1000000, "distinct keys");
 ABSL_FLAG(bool, sessions, false, "tag writes with exactly-once sessions");
+ABSL_FLAG(int, batch, 1, "keys per write RPC (>1 uses the atomic Write RPC)");
 ABSL_FLAG(std::string, label, "", "copied into the RESULT line");
 
 namespace {
@@ -59,6 +61,7 @@ struct Shared {
   uint64_t key_space = 0;
   int value_size = 0;
   bool sessions = false;
+  int batch = 1;
 };
 
 // One in-flight request slot. Completion re-issues the next request, so each
@@ -85,6 +88,22 @@ class Slot {
       get_.set_key(key);
       get_.set_consistency(s_->consistency);
       stub_->async()->Get(ctx_.get(), &get_, &get_resp_, [this](grpc::Status st) { Done(st); });
+    } else if (s_->batch > 1) {
+      is_read_ = false;
+      write_.Clear();
+      for (int i = 0; i < s_->batch; ++i) {
+        auto* op = write_.add_ops();
+        char bkey[32];
+        std::snprintf(bkey, sizeof(bkey), "key%013lu", static_cast<unsigned long>(rng_() % s_->key_space));
+        op->set_key(bkey);
+        const size_t off = rng_() % (s_->value_pool.size() - static_cast<size_t>(s_->value_size));
+        op->set_value(s_->value_pool.substr(off, static_cast<size_t>(s_->value_size)));
+      }
+      if (s_->sessions) {
+        write_.mutable_session()->set_client_id(static_cast<uint64_t>(id_) + 1);
+        write_.mutable_session()->set_seq(++seq_);
+      }
+      stub_->async()->Write(ctx_.get(), &write_, &put_resp_, [this](grpc::Status st) { Done(st); });
     } else {
       is_read_ = false;
       put_.set_key(key);
@@ -123,6 +142,7 @@ class Slot {
   std::mt19937_64 rng_;
   std::unique_ptr<grpc::ClientContext> ctx_;
   kv::api::PutRequest put_;
+  kv::api::WriteRequest write_;
   kv::api::WriteResponse put_resp_;
   kv::api::GetRequest get_;
   kv::api::GetResponse get_resp_;
@@ -160,6 +180,7 @@ int main(int argc, char** argv) {
   s.key_space = absl::GetFlag(FLAGS_key_space);
   s.value_size = absl::GetFlag(FLAGS_value_size);
   s.sessions = absl::GetFlag(FLAGS_sessions);
+  s.batch = std::max(1, absl::GetFlag(FLAGS_batch));
   if (absl::GetFlag(FLAGS_consistency) == "lease") s.consistency = kv::api::LEASE;
   if (absl::GetFlag(FLAGS_consistency) == "stale") s.consistency = kv::api::STALE;
   s.value_pool.resize(1 << 20);
@@ -204,16 +225,18 @@ int main(int argc, char** argv) {
   std::printf("target %s, %d clients x depth %d over %zu channels, %.1fs measured\n", leader.c_str(),
               clients, depth, s.stubs.size(), secs);
   std::printf("writes: %.0f/s  %s\n", w.Count() / secs, w.Summary().c_str());
+  if (s.batch > 1) std::printf("keys written: %.0f/s (%d per RPC)\n", w.Count() * s.batch / secs, s.batch);
   if (r.Count()) std::printf("reads:  %.0f/s  %s\n", r.Count() / secs, r.Summary().c_str());
   std::printf("errors: %lu%s%s\n", static_cast<unsigned long>(errors), last_error.empty() ? "" : " last: ",
               last_error.c_str());
   std::printf(
       "RESULT {\"workload\":\"kvload\",\"label\":\"%s\",\"clients\":%d,\"depth\":%d,\"read_ratio\":%.2f,"
-      "\"consistency\":\"%s\",\"value_size\":%d,\"seconds\":%.2f,\"writes_per_s\":%.0f,\"reads_per_s\":%.0f,"
+      "\"consistency\":\"%s\",\"value_size\":%d,\"batch\":%d,\"seconds\":%.2f,\"writes_per_s\":%.0f,\"keys_per_s\":%.0f,\"reads_per_s\":%.0f,"
       "\"w_p50_us\":%.1f,\"w_p90_us\":%.1f,\"w_p99_us\":%.1f,\"w_p999_us\":%.1f,\"w_max_us\":%.1f,"
       "\"r_p50_us\":%.1f,\"r_p99_us\":%.1f,\"errors\":%lu}\n",
       absl::GetFlag(FLAGS_label).c_str(), clients, depth, s.read_ratio,
-      absl::GetFlag(FLAGS_consistency).c_str(), s.value_size, secs, w.Count() / secs, r.Count() / secs,
+      absl::GetFlag(FLAGS_consistency).c_str(), s.value_size, s.batch, secs, w.Count() / secs,
+      w.Count() * s.batch / secs, r.Count() / secs,
       w.Percentile(50) / 1e3, w.Percentile(90) / 1e3, w.Percentile(99) / 1e3, w.Percentile(99.9) / 1e3,
       w.Max() / 1e3, r.Percentile(50) / 1e3, r.Percentile(99) / 1e3, static_cast<unsigned long>(errors));
   return 0;

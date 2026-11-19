@@ -16,6 +16,9 @@
 
 #include "absl/strings/str_cat.h"
 #include "gtest/gtest.h"
+#include "common/fs.h"
+#include "storage/snapshot.h"
+#include "storage/wal.h"
 #include "test_util.h"
 
 namespace kv::raft {
@@ -345,6 +348,64 @@ TEST(RaftTest, LeadershipTransferIsFast) {
   EXPECT_LT(ms, 100.0);
   ASSERT_EQ(c.WaitLeader(), target);
   ASSERT_TRUE(c.Put(target, "k2", "v2").ok());
+}
+
+// Regression: a follower's WAL holds a stale suffix from an old term (121..160,
+// term 1) followed by the new leader's overwrite of 101..120 (term 2), and a
+// snapshot at 120 covers the overwrite. Recovery must not resurrect 121..160:
+// the overwrite records sit at or below the snapshot index but still truncate.
+TEST(RaftTest, RecoveryDoesNotResurrectTruncatedSuffixAboveSnapshot) {
+  testing::TempDir dir;
+  const std::string node_dir = dir.path() + "/n1";
+  uint64_t first_seg = 0;
+  {
+    WalOptions wo;
+    wo.dir = node_dir + "/wal";
+    wo.segment_bytes = 1 << 20;
+    auto wal = Wal::Open(wo, {}, 0, [](const absl::Status&, std::vector<Wal::Record>&&) {});
+    ASSERT_TRUE(wal.ok());
+    first_seg = (*wal)->ActiveSegment();
+    const std::string noop = EncodeNoop();
+    for (uint64_t i = 1; i <= 160; ++i) (*wal)->Append({i, 1, 100, noop, nullptr});
+    for (uint64_t i = 101; i <= 120; ++i) (*wal)->Append({i, 2, 120, noop, nullptr});
+    (*wal)->Flush();
+  }
+  MemTable mem(16);
+  mem.BeginSnapshot();
+  SnapshotWriteOptions so;
+  so.index = 120;
+  so.term = 2;
+  so.wal_start_segment = first_seg;  // the segment still holds entries above 120
+  ASSERT_TRUE(WriteSnapshot(node_dir + "/snapshots", mem, so).ok());
+  ASSERT_TRUE(WriteFileAtomic(node_dir + "/raft-state", "2 0\n").ok());
+
+  std::map<uint32_t, std::string> members{{1, "127.0.0.1:1"}, {2, "127.0.0.1:2"}, {3, "127.0.0.1:3"}};
+  Transport t(1, members);
+  RaftOptions o;
+  o.id = 1;
+  o.members = members;
+  o.dir = node_dir;
+  o.num_shards = 16;
+  auto node = RaftNode::Open(o, &t);
+  ASSERT_TRUE(node.ok()) << node.status();
+  auto st = (*node)->Status();
+  EXPECT_EQ(st.last_index, 120u) << "stale entries above the snapshot were replayed";
+  EXPECT_EQ(st.commit_index, 120u);
+}
+
+// Regression: a forced snapshot with nothing new to write must complete (and
+// switch copy-on-write tracking back off) instead of wedging the node.
+TEST(RaftTest, RepeatedSnapshotWithNoNewEntriesCompletes) {
+  Cluster c(1);
+  ASSERT_EQ(c.WaitLeader(), 1u);
+  ASSERT_TRUE(c.Put(1, "k", "v").ok());
+  uint64_t a = 0, b = 0;
+  ASSERT_TRUE(c.node(1)->TakeSnapshot(&a).ok());
+  ASSERT_TRUE(c.node(1)->TakeSnapshot(&b).ok());  // nothing applied in between
+  EXPECT_EQ(a, b);
+  ASSERT_TRUE(c.Put(1, "k2", "v2").ok());
+  ASSERT_TRUE(c.node(1)->TakeSnapshot(&b).ok());
+  EXPECT_GT(b, a);
 }
 
 }  // namespace

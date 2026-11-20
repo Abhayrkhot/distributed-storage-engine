@@ -4,6 +4,7 @@
 #include <chrono>
 
 #include "absl/strings/str_cat.h"
+#include "common/thread_name.h"
 #include "common/fs.h"
 #include "common/logging.h"
 #include "storage/snapshot.h"
@@ -334,6 +335,7 @@ void Engine::MaybeStartSnapshot() {
 }
 
 void Engine::SnapshotLoop() {
+  SetThreadName("snapshot");
   for (;;) {
     uint64_t index;
     {

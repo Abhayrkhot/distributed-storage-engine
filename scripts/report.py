@@ -148,9 +148,12 @@ def main():
          "Ranges are across rounds."),
         ("cluster.jsonl", "Replicated cluster (3 nodes, `scripts/bench-cluster.sh`)",
          lambda r: load_table(r, True),
-         "Three `kvd` processes on one host, each with its own WAL on the same NVMe; a write is "
+         "Three `kvd` processes on one host, each with its own WAL on the same disk; a write is "
          "acknowledged after the leader and at least one follower have fsynced it and it is applied. "
-         "`sess` adds exactly-once session tracking; `linear` reads use ReadIndex, `lease` reads use the leader lease."),
+         "`sess` adds exactly-once session tracking; `linear` reads use ReadIndex, `lease` reads use the leader lease. "
+         "`standalone-*` rows are a control: the same load against one non-replicated `kvd`, so the difference "
+         "between `raft3-c64-d16` and `standalone-c64-d16` is the cost of replication, and what they share is the "
+         "gRPC request path on that CPU."),
         ("recovery.jsonl", "Crash recovery (`scripts/bench-recovery.sh`)", recovery_table,
          "A child process loads the keys (100-byte values), optionally checkpoints, writes the WAL tail, "
          "and is killed with SIGKILL. The parent times `Engine::Open` and then reads every key back. "

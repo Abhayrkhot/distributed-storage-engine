@@ -2,6 +2,7 @@
 
 #include <bit>
 
+#include "common/thread_name.h"
 #include "storage/engine.h"
 #include "storage/write_batch.h"
 
@@ -113,6 +114,7 @@ void Applier::ApplyTask(int w, const Task& t) {
 }
 
 void Applier::WorkerLoop(int w) {
+  SetThreadName("apply-" + std::to_string(w));
   Worker& wk = *workers_[static_cast<size_t>(w)];
   std::vector<Chunk> local;
   for (;;) {
@@ -156,4 +158,5 @@ void Applier::RunQuiesced(const std::function<void(uint64_t)>& fn) {
   fn(dispatched_);
 }
 
-}  // namespace kv
+}  // namespace kv#include "common/thread_name.h"
+

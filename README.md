@@ -7,18 +7,20 @@ writes and linearizable reads.
 
 ## Results
 
-Measured with the scripts in `scripts/` on an i7-12700H with an SK hynix PC801
-NVMe, shared with other services (raw flush latency during the runs was ~6×
-the drive's idle figure, so flush-bound numbers are conservative). Details,
-ranges and every configuration: [docs/results.md](docs/results.md).
+Every number is produced by a script in `scripts/` (see
+[results/README.md](results/README.md)). Each suite ran on two hosts. One is a
+dedicated server with fast, uncontended flushes but 2.2 GHz cores. The other
+is a desktop CPU that is about twice as fast per core, sharing its NVMe with
+other services. All writes are fdatasync-durable before they are acknowledged.
 
-| | Result |
-|---|---|
-| **Durable write throughput** (in-process, 16 threads, every write fdatasync'd) | **890K writes/s** median (up to 1.65M) with 256 writes in flight per thread; **8.8× RocksDB 8.9** (`sync=true`, 1,024 threads) on the same disk. Blocking writers: 2.2× RocksDB. |
-| **Crash recovery** (SIGKILL, then `Open` until serving) | **1M records in 0.24 s** from a cold page cache (snapshot + WAL tail), 0.35 s replaying the WAL alone; **10.5M records in 1.18 s**. Every key verified after restart. |
-| **Replication** (3-node Raft over gRPC) | **0 lost acknowledged writes and 0 stale linearizable reads** across 99 leader kills (75 SIGKILL, 24 graceful) under 16 writers. Failover p50 **191 ms**, max 315 ms; graceful handover 45 ms. 61.6K quorum-fsynced writes/s per RPC, 640K keys/s with 16-key batches. |
-| **Lock contention** (32 gRPC clients, one request each) | Sharded rwlocks and the pipelined commit path cut **p99 write latency from 68 ms to 5.0 ms** and raise throughput from 976 to 23.8K writes/s vs the single-lock design. Mixed 50/50 reads: read p99 35 ms → 1.3 ms. |
-
+| | Dedicated server ([details](docs/results.md)) | Desktop, shared disk ([details](docs/results-shared-box.md)) |
+|---|---|---|
+| **Durable writes, 16 threads, pipelined** (256 in flight per thread) | **608K/s**, 4.1× RocksDB 8.9 at 1,024 threads | **879K/s**, 8.6× RocksDB |
+| **Durable writes, 16 blocking threads** | **35.1K/s**, 2.2× RocksDB (16.2K/s) | 7.3K/s (flush-bound on the shared disk), 2.7× RocksDB |
+| **Crash recovery, 1M records** (SIGKILL → serving, every key verified) | **0.28 s** (0.59 s cold cache); 10.5M in 3.3 s | **0.15 s** (0.25 s cold); 10.5M in 1.14 s |
+| **Leader failure** (99 kills under 16 writers, 3-node Raft) | **0 lost acknowledged writes, 0 stale reads**; failover p50 **162 ms**, max 205 ms; graceful handover 9 ms | **0 lost, 0 stale**; failover p50 172 ms, max 272 ms; handover 44 ms |
+| **Lock contention, p99 write latency at 32 clients** | single lock **38 ms → 4.6 ms** sharded + pipelined (4.0K → 18.5K writes/s) | 63 ms → 5.8 ms (0.6K → 8.9K writes/s) |
+| **Replicated writes** (3 nodes, quorum fsync) | 8.7K/s at 32 clients, p99 6.8 ms (1,024 in flight saturates gRPC on this CPU; see details) | 60K/s per RPC at 1,024 in flight, p99 29 ms; 649K keys/s with 16-key batches |
 
 ## What's inside
 
@@ -61,7 +63,9 @@ curl -s localhost:9101/metrics
 Or with Docker Compose: `docker compose -f docker/docker-compose.yml up -d --build`.
 
 Reproduce the benchmarks (inside the dev container; each script writes JSON
-lines to `results/raw/`, and `scripts/report.py` renders `docs/results.md`):
+lines to `results/raw/`; `scripts/report.py --raw results/raw` renders them. The
+published data and how each set was produced are in `results/README.md`, and
+`scripts/slurm/kvbench.sbatch` runs the whole suite on an exclusive HPC node):
 
 ```bash
 scripts/dev.sh scripts/host-info.sh
@@ -70,7 +74,7 @@ scripts/dev.sh scripts/bench-contention.sh   # 32 clients over gRPC: global lock
 scripts/dev.sh scripts/bench-recovery.sh     # SIGKILL + restart with 1M / 10M keys
 scripts/dev.sh scripts/bench-cluster.sh      # 3-node replicated throughput/latency
 scripts/dev.sh scripts/bench-chaos.sh        # 5 min of leader kills under load
-python3 scripts/report.py
+python3 scripts/report.py --raw results/raw --out docs/results.md
 ```
 
 ## Guarantees

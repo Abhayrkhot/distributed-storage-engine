@@ -7,6 +7,7 @@
 #include <sstream>
 
 #include "absl/strings/str_cat.h"
+#include "common/thread_name.h"
 #include "common/fs.h"
 #include "common/logging.h"
 #include "storage/snapshot.h"
@@ -427,6 +428,7 @@ grpc::Status RaftNode::HandleTimeoutNow(const TimeoutNowRequest& req, TimeoutNow
 }
 
 void RaftNode::TickerLoop() {
+  SetThreadName("raft-ticker");
   std::unique_lock<std::mutex> l(mu_);
   while (!stopping_) {
     const auto now = Clock::now();
@@ -503,6 +505,7 @@ void RaftNode::UpdateLeaseAndReads() {
 }
 
 void RaftNode::ReplicatorLoop(Peer* p) {
+  SetThreadName("raft-repl-" + std::to_string(p->id));
   auto* stub = transport_->Stub(p->id);
   const auto hb = milliseconds(opt_.heartbeat_ms);
   Clock::time_point retry_at{};
@@ -631,6 +634,7 @@ void RaftNode::ReplicatorLoop(Peer* p) {
 // known match index (durable there), so the follower answers at once and
 // learns the commit index up to what it holds.
 void RaftNode::HeartbeatLoop(Peer* p) {
+  SetThreadName("raft-hb-" + std::to_string(p->id));
   auto* stub = transport_->Stub(p->id);
   const auto hb = milliseconds(opt_.heartbeat_ms);
   Clock::time_point next{};
@@ -1079,6 +1083,7 @@ void RaftNode::ReadBarrier(ReadMode mode, std::function<void(const absl::Status&
 }
 
 void RaftNode::ReaderLoop() {
+  SetThreadName("raft-reader");
   std::deque<ReadWaiter> todo;
   std::unique_lock<std::mutex> l(mu_);
   for (;;) {
@@ -1130,6 +1135,7 @@ absl::Status RaftNode::TransferLeadership(uint32_t target, uint32_t* new_leader)
 // ---------------------------------------------------------------------------
 
 void RaftNode::DispatcherLoop() {
+  SetThreadName("raft-dispatch");
   std::vector<CommittedEntry> batch;
   for (;;) {
     {
@@ -1192,6 +1198,7 @@ void RaftNode::StartLocalSnapshot() {
 }
 
 void RaftNode::SnapshotLoop() {
+  SetThreadName("raft-snapshot");
   std::unique_lock<std::mutex> l(mu_);
   for (;;) {
     state_cv_.wait(l, [&] { return stopping_ || snap_requested_; });

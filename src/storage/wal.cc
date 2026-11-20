@@ -10,6 +10,7 @@
 #include <functional>
 #include <unordered_set>
 
+#include "common/thread_name.h"
 #include "common/coding.h"
 #include "common/crc32c.h"
 #include "common/fs.h"
@@ -226,6 +227,7 @@ void Wal::Flush() {
 }
 
 void Wal::WriterLoop() {
+  SetThreadName("wal-writer");
   std::vector<Record> group;
   for (;;) {
     absl::Status err;
@@ -380,6 +382,7 @@ absl::Status Wal::RollSegment() {
 }
 
 void Wal::PreparerLoop() {
+  SetThreadName("wal-prepare");
   std::unique_lock<std::mutex> l(seg_mu_);
   for (;;) {
     seg_cv_.wait(l, [&] { return preparer_stop_ || !next_ready_; });

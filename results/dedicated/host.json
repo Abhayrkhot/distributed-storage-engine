@@ -1,0 +1,12 @@
+{
+ "cpu": "Intel(R) Xeon(R) Platinum 8276 CPU @ 2.20GHz",
+ "cores": 112,
+ "memory": "196082240 kB",
+ "disk": "Dell BOSS-S1 virtual disk (M.2 SATA SSD, RAID 1)",
+ "kernel": "5.14.0-362.13.1.el9_3.x86_64",
+ "fdatasync (4 KiB append)": "p50 311 \u00b5s, p99 346 \u00b5s",
+ "fdatasync (4 KiB overwrite)": "p50 135 \u00b5s, p99 159 \u00b5s",
+ "load average at capture": "1.16 1.91 3.49",
+ "note": "dedicated node (exclusive Slurm allocation); data on node-local storage; benchmarks run in the docker/bench.Dockerfile image via Apptainer",
+ "code": "83655ff (cluster suite: next commit, which only adds thread names)"
+}

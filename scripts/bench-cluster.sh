@@ -33,7 +33,7 @@ trap stop EXIT
 
 run() {  # label kvload-args...
   local label=$1; shift
-  "$BUILD/kvload" --endpoints="$EPS" --duration="$DURATION" --warmup=2 --label="$label" "$@" > /tmp/kvload.out
+  "$BUILD/kvload" --endpoints="${TARGET:-$EPS}" --duration="$DURATION" --warmup=2 --label="$label" "$@" > /tmp/kvload.out
   grep '^RESULT' /tmp/kvload.out | sed 's/^RESULT //' | python3 scripts/annotate.py >> "$OUT"
   grep -E '^(writes|reads|errors)' /tmp/kvload.out | sed "s/^/[$label] /"
 }
@@ -46,5 +46,14 @@ for r in $(seq 1 "$ROUNDS"); do
   run raft3-c64-d16-batch16 --clients=64 --depth=16 --batch=16
   run raft3-mixed-linear  --clients=64 --depth=16 --read_ratio=0.5 --consistency=linearizable
   run raft3-mixed-lease   --clients=64 --depth=16 --read_ratio=0.5 --consistency=lease
+  stop
+  # Control: the same high-concurrency load against one standalone engine (no
+  # replication) shows how much of the latency is the gRPC request path itself.
+  rm -rf "$DATA/standalone"
+  "$BUILD/kvd" --mode=engine --listen=127.0.0.1:$((BASE+10)) --dir="$DATA/standalone" --log_level=warning &
+  PIDS+=($!)
+  sleep 1
+  TARGET=127.0.0.1:$((BASE+10)) run standalone-c32-d1  --clients=32 --depth=1
+  TARGET=127.0.0.1:$((BASE+10)) run standalone-c64-d16 --clients=64 --depth=16
   stop
 done

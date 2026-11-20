@@ -47,6 +47,31 @@ new one. Zero-filling goes through `O_DIRECT`. With buffered zero-filling, ext4'
 ordered-mode journal flushed the preparer's dirty pages as part of the WAL's
 next commit, and WAL flush latency rose to several milliseconds.
 
+**Drive write caches.** Two later fixes came from a run on a server with a
+SATA SSD (Dell BOSS) instead of NVMe:
+
+- *Flushes drain everything.* Writing 64 MiB of zeros in one burst parks it in
+  the drive's volatile write cache, and the next `FLUSH` from anyone (the WAL's
+  own fdatasync) has to drain all of it. On SATA that was a ~300 ms stall. The
+  fill now goes out in 2 MiB steps, each fdatasync'ed before the next, and is
+  paced to ~256 MiB/s while the active segment is under half full. Snapshot
+  files use the same rule: written in 2 MiB steps with fdatasync and a shared
+  128 MiB/s token bucket. This followed the observation that 3-node p99 jumped
+  from 7 ms to 350–500 ms as soon as the nodes started snapshotting
+  concurrently.
+- *Read-modify-write.* `O_DIRECT` leaves the zeroed pages out of the page cache,
+  and a buffered append that starts mid-page on an uncached page makes the
+  kernel read that page from the device inside `pwrite`. The writer spent
+  ~0.5 ms per group on these reads. The preparer now reads each segment into
+  the cache after zeroing or recycling it.
+
+Even so, preallocation is a trade-off, not a free win. On the NVMe box it
+doubles or triples durable throughput (an append flush there is 2× an
+overwrite flush and shares the ext4 journal with other tenants). On the SATA
+server, plain appends are faster, because zeroing costs bandwidth that the
+cheaper overwrite flush does not pay back. `--preallocate` exists for that
+reason, and the results report both.
+
 **Recycling safely.** A recycled file still contains valid-looking records from
 its previous life. Every record's CRC32C covers the segment's sequence number
 followed by the record, so a stale record fails verification under the new
@@ -121,7 +146,7 @@ operation to the worker that owns its shard (`shard % workers`):
 - `RunQuiesced(fn)` waits until every submitted entry is applied and runs
   `fn` while nothing else is being applied. Snapshots start there.
 
-With four workers, the in-process write path reaches 1.3–1.6M writes/s.
+With four workers, the pipelined write path reaches ~1.4M writes/s with fsync off (its CPU ceiling on the desktop host) and 0.6–0.9M fdatasync-durable writes/s, depending on the host ([results](results.md)).
 
 ## Raft
 

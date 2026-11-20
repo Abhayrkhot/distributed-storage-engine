@@ -7,6 +7,7 @@ BUILD=${BUILD:-build}
 OUT=${OUT:-results/raw/chaos.jsonl}
 DURATION=${DURATION:-300}
 mkdir -p "$(dirname "$OUT")"
+[ "${APPEND:-0}" = 1 ] || : > "$OUT"
 "$BUILD/kvchaos" --kvd="$BUILD/kvd" --dir=/data/chaos --duration="$DURATION" \
   --kill_interval_ms=3000 --down_ms=1000 --graceful_every=4 --workers=16 \
   --label="leader-kill-${DURATION}s" "$@" | tee /tmp/kvchaos.out

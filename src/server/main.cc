@@ -46,6 +46,7 @@ ABSL_FLAG(int, heartbeat_ms, 20, "raft heartbeat interval");
 ABSL_FLAG(int, election_min_ms, 100, "raft election timeout lower bound");
 ABSL_FLAG(int, election_max_ms, 200, "raft election timeout upper bound");
 ABSL_FLAG(uint64_t, snapshot_trigger_mb, 256, "log MiB between snapshots (0 = never)");
+ABSL_FLAG(uint64_t, snapshot_rate_mb, 128, "snapshot write budget in MiB/s (0 = unlimited)");
 ABSL_FLAG(std::string, sync, "always", "always | none (none is for benchmarks only)");
 ABSL_FLAG(int, metrics_port, 0, "Prometheus /metrics port (0 = off)");
 ABSL_FLAG(std::string, log_level, "info", "debug | info | warning | error");
@@ -112,6 +113,7 @@ int main(int argc, char** argv) {
     o.election_min_ms = absl::GetFlag(FLAGS_election_min_ms);
     o.election_max_ms = absl::GetFlag(FLAGS_election_max_ms);
     o.snapshot_trigger_bytes = absl::GetFlag(FLAGS_snapshot_trigger_mb) << 20;
+    o.snapshot_rate_bytes_per_s = absl::GetFlag(FLAGS_snapshot_rate_mb) << 20;
     o.num_shards = absl::GetFlag(FLAGS_shards);
     o.apply_threads = absl::GetFlag(FLAGS_apply_threads);
     o.wal = wal;
@@ -132,6 +134,7 @@ int main(int argc, char** argv) {
     o.concurrency = absl::GetFlag(FLAGS_concurrency) == "global" ? kv::Concurrency::kGlobalLock
                                                                   : kv::Concurrency::kPipelined;
     o.snapshot_trigger_bytes = absl::GetFlag(FLAGS_snapshot_trigger_mb) << 20;
+    o.snapshot_rate_bytes_per_s = absl::GetFlag(FLAGS_snapshot_rate_mb) << 20;
     o.wal = wal;
     auto e = kv::Engine::Open(o);
     if (!e.ok()) {

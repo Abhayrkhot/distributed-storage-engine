@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <unordered_set>
 
 #include "common/coding.h"
@@ -23,12 +24,19 @@ uint64_t NowNanos() {
                                    .count());
 }
 
-// Creates `path` and fills it with `bytes` zeros. O_DIRECT keeps the zeros out
-// of the page cache: with ext4's data=ordered journaling, buffered dirty pages
-// of a freshly allocated file get flushed by whichever journal commit comes
-// next, which would make the WAL's own fdatasync wait for them.
-absl::Status CreateZeroedFile(const std::string& path, uint64_t bytes, int* fd_out) {
+// Creates `path` and fills it with `bytes` zeros.
+//
+// O_DIRECT keeps the zeros out of the page cache, so ext4's ordered-mode
+// journal never makes a WAL fdatasync wait for the preparer's dirty pages.
+// The zeros still land in the drive's volatile write cache, though, and the
+// next FLUSH anyone issues (the WAL's own fdatasync) must drain all of it: on
+// a SATA SSD, 64 MiB at once is a ~300 ms stall. So the fill goes out in small
+// steps, each flushed before the next, and `pace` can slow it further while
+// the WAL has room to spare.
+absl::Status CreateZeroedFile(const std::string& path, uint64_t bytes, int* fd_out,
+                              const std::function<void()>& pace) {
   constexpr size_t kChunk = 1 << 20;
+  constexpr int kChunksPerFlush = 2;
   bytes = (bytes + 4095) & ~uint64_t{4095};
   int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC | O_DIRECT, 0644);
   bool direct = fd >= 0;
@@ -41,9 +49,14 @@ absl::Status CreateZeroedFile(const std::string& path, uint64_t bytes, int* fd_o
   }
   std::memset(buf, 0, kChunk);
   absl::Status st;
+  int chunks = 0;
   for (uint64_t off = 0; st.ok() && off < bytes; off += kChunk) {
     const size_t n = static_cast<size_t>(std::min<uint64_t>(kChunk, bytes - off));
     st = PWriteAll(fd, static_cast<const char*>(buf), n, off);
+    if (st.ok() && ++chunks % kChunksPerFlush == 0) {
+      if (::fdatasync(fd) != 0) st = ErrnoStatus("fdatasync", path, errno);
+      if (pace) pace();
+    }
   }
   ::free(buf);
   if (st.ok() && ::fdatasync(fd) != 0) st = ErrnoStatus("fdatasync", path, errno);
@@ -54,6 +67,23 @@ absl::Status CreateZeroedFile(const std::string& path, uint64_t bytes, int* fd_o
   if (fd < 0) return ErrnoStatus("open", path, errno);
   *fd_out = fd;
   return absl::OkStatus();
+}
+
+// Pulls a segment into the page cache. A WAL append that starts mid-page on a
+// page that is not cached makes the kernel read it from the device first
+// (read-modify-write) inside the writer's pwrite; with O_DIRECT-zeroed or
+// recycled segments every page starts uncached.
+void WarmPageCache(int fd, uint64_t bytes, bool synchronous) {
+  if (!synchronous) {
+    ::posix_fadvise(fd, 0, static_cast<off_t>(bytes), POSIX_FADV_WILLNEED);
+    return;
+  }
+  std::string buf(1 << 20, '\0');
+  for (uint64_t off = 0; off < bytes;) {
+    ssize_t n = ::pread(fd, buf.data(), buf.size(), static_cast<off_t>(off));
+    if (n <= 0) break;
+    off += static_cast<uint64_t>(n);
+  }
 }
 
 // A recycled file still starts with a record from its previous life. Zero the
@@ -132,10 +162,12 @@ absl::Status Wal::Start(std::vector<WalSegment> existing, uint64_t last_index) {
       ::close(fd);
       return st;
     }
+    WarmPageCache(fd, opt_.segment_bytes, /*synchronous=*/false);
   } else if (opt_.preallocate) {
-    if (auto st = CreateZeroedFile(PathFor(active_seq_), opt_.segment_bytes, &fd); !st.ok()) {
+    if (auto st = CreateZeroedFile(PathFor(active_seq_), opt_.segment_bytes, &fd, nullptr); !st.ok()) {
       return st;
     }
+    WarmPageCache(fd, opt_.segment_bytes, /*synchronous=*/false);
   } else {
     fd = ::open(PathFor(active_seq_).c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) return ErrnoStatus("open", PathFor(active_seq_), errno);
@@ -293,6 +325,7 @@ absl::Status Wal::WriteGroup(std::vector<Record>& group, uint64_t* bytes_written
   }
   bytes += buf_.size();
   if (auto st = FlushWithEndMarker(); !st.ok()) return st;
+  active_offset_.store(active_.offset, std::memory_order_relaxed);
   if (sync) {
     const uint64_t t0 = NowNanos();
     if (::fdatasync(active_.fd) != 0) return ErrnoStatus("fdatasync", PathFor(active_.seq), errno);
@@ -334,6 +367,7 @@ absl::Status Wal::RollSegment() {
   const int old_fd = active_.fd;
   active_seq_ = active_.seq + 1;
   active_ = Segment{active_seq_, next_fd_, 0, 0, 0};
+  active_offset_.store(0, std::memory_order_relaxed);
   next_fd_ = -1;
   next_ready_ = false;
   sealed_.push_back(sealed);
@@ -368,12 +402,21 @@ void Wal::PreparerLoop() {
         if (fd < 0) st = ErrnoStatus("open", path, errno);
       }
       if (st.ok()) st = ClearRecycledHeader(fd, path);
+      if (st.ok()) WarmPageCache(fd, opt_.segment_bytes, /*synchronous=*/true);
       if (st.ok()) {
         std::lock_guard<std::mutex> sl(stats_mu_);
         ++stats_.segments_recycled;
       }
     } else if (opt_.preallocate) {
-      st = CreateZeroedFile(path, opt_.segment_bytes, &fd);
+      // Pace the fill to ~256 MiB/s while the active segment is less than
+      // half full; once the writer is closer to rolling, go flat out.
+      auto pace = [this] {
+        if (active_offset_.load(std::memory_order_relaxed) < opt_.segment_bytes / 2) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(8));
+        }
+      };
+      st = CreateZeroedFile(path, opt_.segment_bytes, &fd, pace);
+      if (st.ok()) WarmPageCache(fd, opt_.segment_bytes, /*synchronous=*/true);
     } else {
       fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
       if (fd < 0) st = ErrnoStatus("open", path, errno);

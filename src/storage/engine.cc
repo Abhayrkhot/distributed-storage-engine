@@ -56,7 +56,9 @@ void RunParallel(int n, Fn fn) {
 Engine::Engine(const EngineOptions& options) : opt_(options), mem_(options.num_shards) {
   if (opt_.wal.dir.empty()) opt_.wal.dir = opt_.dir + "/wal";
   if (opt_.recovery_threads <= 0) {
-    opt_.recovery_threads = std::max(1u, std::thread::hardware_concurrency());
+    // Past ~16 threads recovery gets slower, not faster: the B-tree inserts
+    // are memory-bound and a second socket only adds cross-node traffic.
+    opt_.recovery_threads = static_cast<int>(std::clamp(std::thread::hardware_concurrency(), 1u, 16u));
   }
 }
 
@@ -346,6 +348,7 @@ void Engine::SnapshotLoop() {
     so.wal_start_segment = wal_ ? wal_->FirstSegmentAbove(index) : 0;
     so.files = opt_.snapshot_files;
     so.threads = opt_.snapshot_threads;
+    so.rate_limit_bytes_per_s = opt_.snapshot_rate_bytes_per_s;
     auto m = WriteSnapshot(opt_.dir + "/snapshots", mem_, so);
     if (m.ok() && wal_) wal_->ReleaseUpTo(index);
     if (!m.ok()) KV_LOG(Error) << "snapshot at " << index << " failed: " << m.status();

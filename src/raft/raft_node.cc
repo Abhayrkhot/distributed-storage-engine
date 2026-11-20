@@ -82,7 +82,7 @@ absl::Status RaftNode::Recover() {
     if (!(in >> current_term_ >> voted_for_)) return absl::DataLossError("bad raft-state file");
   }
   int threads = opt_.recovery_threads > 0 ? opt_.recovery_threads
-                                          : static_cast<int>(std::thread::hardware_concurrency());
+                                          : static_cast<int>(std::clamp(std::thread::hardware_concurrency(), 1u, 16u));
   sm_ = std::make_unique<StateMachine>(opt_.num_shards, opt_.apply_threads);
 
   uint64_t wal_start = 0;
@@ -985,7 +985,7 @@ grpc::Status RaftNode::HandleInstallSnapshot(grpc::ServerReader<SnapshotChunk>* 
   cleanup.dir.clear();  // renamed into place
   if (!keep_suffix) wal_->DropBefore(start_seg);
   const int threads = opt_.recovery_threads > 0 ? opt_.recovery_threads
-                                                : static_cast<int>(std::thread::hardware_concurrency());
+                                                : static_cast<int>(std::clamp(std::thread::hardware_concurrency(), 1u, 16u));
   if (auto s = sm_->Restore(root, m, threads); !s.ok()) KV_LOG(Fatal) << "restore: " << s;
   PruneSnapshots(root, 2);
   {
@@ -1203,6 +1203,7 @@ void RaftNode::SnapshotLoop() {
     so.app_state = std::move(snap_pending_state_);
     so.files = 16;
     so.threads = opt_.snapshot_threads;
+    so.rate_limit_bytes_per_s = opt_.snapshot_rate_bytes_per_s;
     l.unlock();
     so.wal_start_segment = wal_->FirstSegmentAbove(so.index);
     auto m = WriteSnapshot(opt_.dir + "/snapshots", sm_->memtable(), so);

@@ -34,9 +34,20 @@ def probe(overwrite, n=1000):
     return f"p50 {lat[n//2]*1e6:.0f} µs, p99 {lat[n*99//100]*1e6:.0f} µs"
 disk = "?"
 try:
-    disk = open("/sys/block/nvme0n1/device/model").read().strip()
-except OSError:
+    # Model of the device backing the data directory.
+    src = subprocess.run(["findmnt", "-no", "SOURCE", "--target", data], capture_output=True, text=True).stdout.strip()
+    parent = subprocess.run(["lsblk", "-no", "PKNAME", src], capture_output=True, text=True).stdout.split()
+    dev = parent[0] if parent else os.path.basename(src)
+    fields = subprocess.run(["lsblk", "-dno", "MODEL,TRAN,ROTA", "/dev/" + dev], capture_output=True, text=True).stdout.split()
+    if fields:
+        disk = " ".join(fields[:-1]) + (" (rotational)" if fields[-1] == "1" and "BOSS" not in fields[0] else "")
+except Exception:
     pass
+if disk == "?":
+    try:
+        disk = open("/sys/block/nvme0n1/device/model").read().strip()
+    except OSError:
+        pass
 info = {
     "cpu": first("/proc/cpuinfo", "model name"),
     "cores": os.cpu_count(),

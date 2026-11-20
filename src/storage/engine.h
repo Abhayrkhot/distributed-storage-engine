@@ -45,6 +45,7 @@ struct EngineOptions {
   uint64_t snapshot_trigger_bytes = 512ull << 20;
   int snapshot_files = 16;
   int snapshot_threads = 4;
+  uint64_t snapshot_rate_bytes_per_s = 128ull << 20;  // 0 = unlimited
   int recovery_threads = 0;  // 0 = hardware concurrency
 };
 

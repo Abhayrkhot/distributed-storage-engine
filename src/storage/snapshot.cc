@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <thread>
 
 #include "absl/strings/str_cat.h"
@@ -20,7 +21,31 @@ namespace {
 
 constexpr uint32_t kFormatVersion = 1;
 constexpr size_t kBlockHeader = 4 + 8 + 8;
-constexpr size_t kFlushBytes = 8u << 20;
+constexpr size_t kFlushBytes = 2u << 20;  // write + fdatasync granularity
+
+// Token bucket shared by the snapshot writer threads.
+class RateLimiter {
+ public:
+  explicit RateLimiter(uint64_t bytes_per_s) : rate_(bytes_per_s), start_(Clock::now()) {}
+  void Acquire(uint64_t bytes) {
+    if (rate_ == 0) return;
+    std::chrono::steady_clock::time_point due;
+    {
+      std::lock_guard<std::mutex> l(mu_);
+      granted_ += bytes;
+      due = start_ + std::chrono::nanoseconds(static_cast<int64_t>(
+                         static_cast<double>(granted_) / static_cast<double>(rate_) * 1e9));
+    }
+    std::this_thread::sleep_until(due);
+  }
+
+ private:
+  using Clock = std::chrono::steady_clock;
+  const uint64_t rate_;
+  const Clock::time_point start_;
+  std::mutex mu_;
+  uint64_t granted_ = 0;
+};
 
 bool ParseSnapName(std::string_view name, uint64_t* index) {
   constexpr std::string_view kPre = "snap-";
@@ -114,6 +139,7 @@ absl::StatusOr<snapshot::SnapshotManifest> WriteSnapshot(const std::string& root
   std::vector<snapshot::SnapshotFile> files(static_cast<size_t>(nfiles));
   std::vector<uint64_t> keys(static_cast<size_t>(nfiles)), bytes(static_cast<size_t>(nfiles));
 
+  RateLimiter limiter(opt.rate_limit_bytes_per_s);
   absl::Status st = ParallelFor(nfiles, opt.threads, [&](int f) -> absl::Status {
     const std::string name = absl::StrFormat("data-%04d", f);
     const std::string path = tmp_dir + "/" + name;
@@ -134,13 +160,16 @@ absl::StatusOr<snapshot::SnapshotManifest> WriteSnapshot(const std::string& root
       buf.append(shard_data);
       if (buf.size() >= kFlushBytes) {
         crc = crc32c::Extend(crc, buf.data(), buf.size());
+        limiter.Acquire(buf.size());
         s = PWriteAll(fd, buf.data(), buf.size(), off);
+        if (s.ok() && ::fdatasync(fd) != 0) s = ErrnoStatus("fdatasync", path, errno);
         off += buf.size();
         buf.clear();
       }
     }
     if (s.ok() && !buf.empty()) {
       crc = crc32c::Extend(crc, buf.data(), buf.size());
+      limiter.Acquire(buf.size());
       s = PWriteAll(fd, buf.data(), buf.size(), off);
       off += buf.size();
     }

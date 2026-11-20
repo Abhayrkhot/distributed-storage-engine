@@ -28,6 +28,10 @@ struct SnapshotWriteOptions {
   int files = 16;
   int threads = 4;
   int retain = 2;  // complete snapshots to keep (newest first)
+  // Background I/O budget across all writer threads (0 = unlimited). Data is
+  // also fdatasync'ed every few MiB: one big flush at the end would sit in the
+  // drive's write cache and make the WAL's next fdatasync drain all of it.
+  uint64_t rate_limit_bytes_per_s = 128ull << 20;
 };
 
 struct SnapshotLoadStats {

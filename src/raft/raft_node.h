@@ -58,6 +58,7 @@ struct RaftOptions {
   uint32_t num_shards = 256;
   int apply_threads = 4;
   int snapshot_threads = 4;
+  uint64_t snapshot_rate_bytes_per_s = 128ull << 20;  // 0 = unlimited
   int recovery_threads = 0;
   WalOptions wal;
   bool check_quorum = true;

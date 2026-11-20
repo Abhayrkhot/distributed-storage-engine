@@ -161,6 +161,7 @@ class Wal {
 
   // ---- writer-thread state ----
   Segment active_;
+  std::atomic<uint64_t> active_offset_{0};  // active_.offset, for the preparer's pacing
   std::string buf_;  // encoded records not yet written to active_
   WalStats stats_;   // guarded by stats_mu_
   mutable std::mutex stats_mu_;

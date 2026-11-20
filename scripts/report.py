@@ -117,8 +117,17 @@ def main():
     if host:
         doc += ["## Host", ""]
         for key, val in host.items():
-            doc.append(f"- **{key}**: {val}")
+            if val:
+                doc.append(f"- **{key}**: {val}")
         doc.append("")
+    doc += ["## Reading these numbers", "",
+            "Every write below is acknowledged only after `fdatasync`, so most numbers scale with the "
+            "device's flush latency. These runs shared the machine with other services that also flush the "
+            "same NVMe, and the raw 4 KiB overwrite+fdatasync latency during the runs was ~1.5 ms, about six "
+            "times what the drive does when idle. Treat the absolute throughput and latency as conservative. "
+            "The comparisons (global lock vs pipelined, this engine vs RocksDB) were interleaved round by "
+            "round, so both sides saw the same conditions. Recovery and failover are not flush-bound and "
+            "barely move. Ranges show min–max across rounds.", ""]
     sections = [
         ("engine.jsonl", "Storage engine (in-process, `scripts/bench-engine.sh`)", engine_table,
          "16 client threads, 100-byte values, every write fdatasync-durable before it is acknowledged "

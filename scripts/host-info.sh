@@ -46,7 +46,7 @@ info = {
     "fdatasync (4 KiB append)": probe(False),
     "fdatasync (4 KiB overwrite)": probe(True),
     "load average at capture": " ".join(f"{x:.2f}" for x in os.getloadavg()),
-    "note": "shared development machine; other services were running (see docs/results.md)",
+    "note": os.environ.get("HOST_NOTE", ""),
 }
 json.dump(info, open(out, "w"), indent=1)
 print(json.dumps(info, indent=1))

@@ -5,7 +5,20 @@ log, a sharded in-memory index with copy-on-write snapshots, parallel crash
 recovery, and Raft replication over gRPC with quorum-acknowledged, exactly-once
 writes and linearizable reads.
 
-<!-- RESULTS -->
+## Results
+
+Measured with the scripts in `scripts/` on an i7-12700H with an SK hynix PC801
+NVMe, shared with other services (raw flush latency during the runs was ~6×
+the drive's idle figure, so flush-bound numbers are conservative). Details,
+ranges and every configuration: [docs/results.md](docs/results.md).
+
+| | Result |
+|---|---|
+| **Durable write throughput** (in-process, 16 threads, every write fdatasync'd) | **890K writes/s** median (up to 1.65M) with 256 writes in flight per thread; **8.8× RocksDB 8.9** (`sync=true`, 1,024 threads) on the same disk. Blocking writers: 2.2× RocksDB. |
+| **Crash recovery** (SIGKILL, then `Open` until serving) | **1M records in 0.24 s** from a cold page cache (snapshot + WAL tail), 0.35 s replaying the WAL alone; **10.5M records in 1.18 s**. Every key verified after restart. |
+| **Replication** (3-node Raft over gRPC) | **0 lost acknowledged writes and 0 stale linearizable reads** across 99 leader kills (75 SIGKILL, 24 graceful) under 16 writers. Failover p50 **191 ms**, max 315 ms; graceful handover 45 ms. 61.6K quorum-fsynced writes/s per RPC, 640K keys/s with 16-key batches. |
+| **Lock contention** (32 gRPC clients, one request each) | Sharded rwlocks and the pipelined commit path cut **p99 write latency from 68 ms to 5.0 ms** and raise throughput from 976 to 23.8K writes/s vs the single-lock design. Mixed 50/50 reads: read p99 35 ms → 1.3 ms. |
+
 
 ## What's inside
 
@@ -32,7 +45,7 @@ docker build -t kvdev:24.04 -f docker/dev.Dockerfile docker
 scripts/dev.sh 'cmake -S . -B build -G Ninja && cmake --build build && ./build/kv_tests'
 ```
 
-Run a 3-node cluster:
+Run a 3-node cluster (clients use the listed ports; Raft traffic uses port + 1000):
 
 ```bash
 M=1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003
@@ -68,6 +81,8 @@ python3 scripts/report.py
   lease, whose safety relies on bounded clock drift; `STALE` reads may lag.
 - A write retried with the same `(client_id, seq)` is applied at most once.
 - A node that cannot persist to disk stops instead of acknowledging.
+- `Scan` reads shards one at a time, so it is not a point-in-time view across
+  shards; single-key reads are linearizable.
 - Membership is static, there is no authentication or TLS, and the data set
   must fit in memory (the index is an in-memory B-tree, recovered from
   snapshots and the WAL).

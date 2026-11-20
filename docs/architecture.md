@@ -146,8 +146,18 @@ term per round trip. The leader writes its own WAL in parallel with
 replication and counts its own durable index as one vote. An entry commits
 when a majority has it durable and it belongs to the current term (Raft §5.4.2).
 
-**CheckQuorum.** A leader that has not heard from a majority within the
-election timeout steps down. Writes pending on it fail as UNAVAILABLE. Their
+**Heartbeats travel separately.** Each follower also has a heartbeat thread
+that sends an empty AppendEntries every 20 ms. Its `prev` is the follower's
+known match index, so the follower can answer at once. As a result, leadership
+confirmation, CheckQuorum, the lease and ReadIndex rounds never queue behind a
+multi-megabyte batch or a slow follower fsync. Before this change, 3-node p99
+under load was ~130 ms, with occasional leader churn. Peer traffic also has its
+own gRPC server (client port + 1000, like etcd's separate peer port), so a
+client flood cannot delay it either.
+
+**CheckQuorum.** A leader that has not heard from a majority within two
+election timeouts steps down. This only bounds how quickly a cut-off leader
+gives up; lease safety does not depend on it. Writes pending on it fail as UNAVAILABLE. Their
 outcome is unknown, which exactly-once sessions resolve (below).
 
 **Reads.** `LINEARIZABLE` uses ReadIndex. The read index is
@@ -198,11 +208,35 @@ peers in both directions. The in-process tests use it for partitions, and
 | WAL preparer | 1 | next segment ready (recycled or zero-filled) |
 | applier workers | 4 | apply by shard, complete requests |
 | replicators | N−1 | one in-flight AppendEntries per follower |
+| heartbeat senders | N−1 | leadership confirmation, independent of appends |
 | dispatcher | 1 | committed entries → session dedup → applier |
 | reader | 1 | serves confirmed linearizable reads once applied |
 | ticker | 1 | elections, CheckQuorum, transfer timeout |
 | snapshot writer | 1 (+4 serializers) | background snapshots |
-| gRPC | pool | callback API for KV; sync for Raft and Admin |
+| gRPC | 2 servers | client: callback API for KV, sync Admin; peer: sync Raft |
+
+## Bugs found by review (and the tests that pin them)
+
+An independent review of the Raft and WAL code found, among smaller issues:
+
+- **Stale suffix above a snapshot.** Suppose a follower's WAL held entries
+  121..160 from an old term, followed by the new leader's overwrite of
+  101..120, and a snapshot at 120 then covered the overwrite. Replay skipped
+  the overwrite records because they were at or below the snapshot index, so
+  it never truncated 121..160. A restarted node could then vote for a
+  candidate missing committed entries. Records at or below the snapshot index
+  now truncate everything replayed above it.
+  `RaftTest.RecoveryDoesNotResurrectTruncatedSuffixAboveSnapshot` reproduces
+  the bug: without the fix it recovers last index 160 instead of 120.
+- **Concurrent InstallSnapshot streams** shared one staging directory. Each
+  stream now gets a private directory, installs are serialized, and a sender
+  stops once it is deposed.
+- **Snapshot with nothing to write** left the snapshot thread waiting forever
+  and copy-on-write tracking switched on.
+  `RaftTest.RepeatedSnapshotWithNoNewEntriesCompletes` covers it.
+- **Lease edge cases.** Lease reads are now disabled during a leadership
+  transfer, the lease counts from the start of a snapshot stream, and a
+  restarted node sits out one election timeout before voting.
 
 ## Testing
 

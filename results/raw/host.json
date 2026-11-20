@@ -1,0 +1,12 @@
+{
+ "cpu": "12th Gen Intel(R) Core(TM) i7-12700H",
+ "cores": 20,
+ "memory": "64191404 kB",
+ "disk": "PC801 NVMe SK hynix 1TB",
+ "kernel": "7.0.0-31-generic",
+ "fdatasync (4 KiB append)": "p50 3213 \u00b5s, p99 6432 \u00b5s",
+ "fdatasync (4 KiB overwrite)": "p50 1505 \u00b5s, p99 1738 \u00b5s",
+ "load average at capture": "4.75 7.12 7.00",
+ "note": "shared development machine: kind clusters, etcd, Cassandra and MySQL from other projects were running and issuing their own device flushes; on a quiet run the same 4 KiB overwrite fdatasync measured p50 250 \u00b5s",
+ "code": "a3a9820 (benchmarked binaries)"
+}

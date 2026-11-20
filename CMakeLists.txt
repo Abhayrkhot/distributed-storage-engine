@@ -42,21 +42,29 @@ find_package(gRPC CONFIG REQUIRED)
 # ---------------------------------------------------------------------------
 # Generated protobuf / gRPC code
 # ---------------------------------------------------------------------------
-add_library(kv_proto STATIC)
+# protoc is invoked directly rather than through protobuf_generate(), whose
+# output layout differs between CMake versions (Ubuntu's protobuf ships no
+# CMake package, so the FindProtobuf module's copy is used).
+set(KV_PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/proto)
+set(KV_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/gen)
+set(KV_PROTO_SRCS)
+foreach(name kv raft snapshot)
+  set(out ${KV_GEN_DIR}/proto/${name})
+  add_custom_command(
+    OUTPUT ${out}.pb.cc ${out}.pb.h ${out}.grpc.pb.cc ${out}.grpc.pb.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${KV_GEN_DIR}/proto
+    COMMAND $<TARGET_FILE:protobuf::protoc> --proto_path=${KV_PROTO_DIR}
+            --cpp_out=${KV_GEN_DIR}/proto --grpc_out=${KV_GEN_DIR}/proto
+            --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
+            ${KV_PROTO_DIR}/${name}.proto
+    DEPENDS ${KV_PROTO_DIR}/${name}.proto protobuf::protoc gRPC::grpc_cpp_plugin
+    COMMENT "protoc ${name}.proto")
+  list(APPEND KV_PROTO_SRCS ${out}.pb.cc ${out}.grpc.pb.cc)
+endforeach()
+add_library(kv_proto STATIC ${KV_PROTO_SRCS})
 target_link_libraries(kv_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
-target_include_directories(kv_proto PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/proto)
-set(KV_PROTOS ${CMAKE_CURRENT_SOURCE_DIR}/proto/kv.proto
-              ${CMAKE_CURRENT_SOURCE_DIR}/proto/raft.proto
-              ${CMAKE_CURRENT_SOURCE_DIR}/proto/snapshot.proto)
-target_sources(kv_proto PRIVATE ${KV_PROTOS})
-protobuf_generate(TARGET kv_proto LANGUAGE cpp
-  IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/proto
-  PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/proto)
-protobuf_generate(TARGET kv_proto LANGUAGE grpc
-  IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/proto
-  PROTOC_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/proto
-  GENERATE_EXTENSIONS .grpc.pb.h .grpc.pb.cc
-  PLUGIN "protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>")
+# Our code includes "proto/kv.pb.h"; generated code includes "kv.pb.h".
+target_include_directories(kv_proto PUBLIC ${KV_GEN_DIR} ${KV_GEN_DIR}/proto)
 target_compile_options(kv_proto PRIVATE -w)
 
 # ---------------------------------------------------------------------------
